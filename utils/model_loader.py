@@ -264,65 +264,106 @@ class _InSPyReNetWrapper:
 #   1. depth_pro already installed as pip package
 #   2. transformers AutoModelForDepthEstimation (falls back gracefully)
 #   3a. Download source ZIP from GitHub → extract to .cache/depth_pro_src/
-#   3b. Download weights from HuggingFace snapshot
-#   3c. Load via importlib from extracted source
+#   3b. Patch optional dependencies (pillow_heif etc.) in extracted source
+#   3c. Download weights via hf_hub_download
+#   3d. Load via importlib from extracted source
 # ==========================================================================
 
 _DEPTH_PRO_GITHUB_ZIP = (
     "https://github.com/apple/ml-depth-pro/archive/refs/heads/main.zip"
 )
 
+# Stub code injected at the top of utils.py to silence optional imports
+_PILLOW_HEIF_STUB = '''
+# --- nkVasi patch: make pillow_heif optional ---
+try:
+    import pillow_heif as pillow_heif
+except ImportError:
+    import types as _types
+    pillow_heif = _types.ModuleType("pillow_heif")
+    pillow_heif.register_heif_opener = lambda *a, **kw: None
+    import sys as _sys
+    _sys.modules["pillow_heif"] = pillow_heif
+# --- end nkVasi patch ---
+'''
+
+
+def _patch_depth_pro_src(src_parent: str) -> None:
+    """
+    Patch depth_pro/utils.py in the extracted source so that
+    `import pillow_heif` does not crash when the package is absent.
+    The patch is idempotent — safe to call on every startup.
+    """
+    utils_path = os.path.join(src_parent, "depth_pro", "utils.py")
+    if not os.path.exists(utils_path):
+        return  # nothing to patch
+
+    with open(utils_path, "r", encoding="utf-8") as fh:
+        src = fh.read()
+
+    # Already patched?
+    if "nkVasi patch" in src:
+        return
+
+    # Replace bare `import pillow_heif` with our stub
+    if "import pillow_heif" in src:
+        patched = src.replace("import pillow_heif", _PILLOW_HEIF_STUB, 1)
+        with open(utils_path, "w", encoding="utf-8") as fh:
+            fh.write(patched)
+
 
 def _ensure_depth_pro_src() -> str:
     """
     Ensure the Depth Pro Python source is present in _DEPTH_PRO_SRC_CACHE.
     Downloads and extracts from GitHub if not already present.
+    Always applies compatibility patches before returning.
     Returns the path that should be added to sys.path (contains depth_pro/).
     """
-    # Expected: .cache/depth_pro_src/ml-depth-pro-main/src/
     src_parent = os.path.join(_DEPTH_PRO_SRC_CACHE, "ml-depth-pro-main", "src")
     marker     = os.path.join(src_parent, "depth_pro", "__init__.py")
 
-    if os.path.exists(marker):
-        return src_parent
-
-    # Download ZIP
-    import urllib.request
-    import zipfile
-    c = _SpinnerCtx.C
-
-    os.makedirs(_DEPTH_PRO_SRC_CACHE, exist_ok=True)
-    zip_path = os.path.join(_DEPTH_PRO_SRC_CACHE, "ml-depth-pro-main.zip")
-
-    print(f"  {c['dim']}Downloading Depth Pro source from GitHub…{c['reset']}")
-    print(f"  {c['dim']}URL: {_DEPTH_PRO_GITHUB_ZIP}{c['reset']}")
-
-    try:
-        urllib.request.urlretrieve(_DEPTH_PRO_GITHUB_ZIP, zip_path)
-    except Exception as e:
-        raise RuntimeError(
-            f"[nkVasi] Failed to download Depth Pro source ZIP: {e}\n"
-            f"Please install manually: pip install git+https://github.com/apple/ml-depth-pro"
-        ) from e
-
-    print(f"  {c['dim']}Extracting…{c['reset']}")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(_DEPTH_PRO_SRC_CACHE)
-
-    os.remove(zip_path)  # clean up zip, keep extracted dir
-
     if not os.path.exists(marker):
-        # Fallback: search recursively in case archive structure differs
-        for dp, dn, _ in os.walk(_DEPTH_PRO_SRC_CACHE):
-            if "depth_pro" in dn:
-                candidate = os.path.join(dp, "depth_pro", "__init__.py")
-                if os.path.exists(candidate):
-                    return dp
-        raise RuntimeError(
-            f"[nkVasi] Could not find depth_pro/__init__.py after extraction.\n"
-            f"Cache dir: {_DEPTH_PRO_SRC_CACHE}"
-        )
+        import urllib.request
+        import zipfile
+        c = _SpinnerCtx.C
 
+        os.makedirs(_DEPTH_PRO_SRC_CACHE, exist_ok=True)
+        zip_path = os.path.join(_DEPTH_PRO_SRC_CACHE, "ml-depth-pro-main.zip")
+
+        print(f"  {c['dim']}Downloading Depth Pro source from GitHub…{c['reset']}")
+        print(f"  {c['dim']}URL: {_DEPTH_PRO_GITHUB_ZIP}{c['reset']}")
+
+        try:
+            urllib.request.urlretrieve(_DEPTH_PRO_GITHUB_ZIP, zip_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"[nkVasi] Failed to download Depth Pro source ZIP: {e}\n"
+                f"Please install manually: "
+                f"pip install git+https://github.com/apple/ml-depth-pro"
+            ) from e
+
+        print(f"  {c['dim']}Extracting…{c['reset']}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(_DEPTH_PRO_SRC_CACHE)
+        os.remove(zip_path)
+
+        # Fallback: search if archive structure differs
+        if not os.path.exists(marker):
+            for dp, dn, _ in os.walk(_DEPTH_PRO_SRC_CACHE):
+                if "depth_pro" in dn:
+                    candidate = os.path.join(dp, "depth_pro", "__init__.py")
+                    if os.path.exists(candidate):
+                        src_parent = dp
+                        break
+            else:
+                raise RuntimeError(
+                    f"[nkVasi] Could not find depth_pro/__init__.py after extraction.\n"
+                    f"Cache dir: {_DEPTH_PRO_SRC_CACHE}"
+                )
+
+    # Always patch on every call (idempotent) — handles case where
+    # source was extracted by a previous version before patching existed.
+    _patch_depth_pro_src(src_parent)
     return src_parent
 
 
@@ -333,6 +374,16 @@ def _importlib_load_depth_pro(src_parent: str):
     for key in list(sys.modules.keys()):
         if key == "depth_pro" or key.startswith("depth_pro."):
             del sys.modules[key]
+
+    # Also pre-register stub for pillow_heif to be safe
+    if "pillow_heif" not in sys.modules:
+        try:
+            import pillow_heif  # noqa: F401
+        except ImportError:
+            import types
+            stub = types.ModuleType("pillow_heif")
+            stub.register_heif_opener = lambda *a, **kw: None  # type: ignore
+            sys.modules["pillow_heif"] = stub
 
     init_path = os.path.join(src_parent, "depth_pro", "__init__.py")
     spec = importlib.util.spec_from_file_location(
@@ -388,16 +439,15 @@ class _DepthProWrapper:
         # ---- Strategy 3: GitHub source ZIP + HF weights ----
         print(f"  {c['dim']}Strategy 3/3 · GitHub source ZIP + HF weights{c['reset']}")
 
-        # 3a — Get Python source from GitHub
+        # 3a/3b — Source (with patches) + weights
         try:
             with _SpinnerCtx("DepthPro · source from GitHub  "):
-                src_parent = _ensure_depth_pro_src()
+                src_parent = _ensure_depth_pro_src()  # patches applied inside
         except Exception as e:
             raise RuntimeError(str(e)) from e
 
         print(f"  {c['dim']}Source ready at: {src_parent}{c['reset']}")
 
-        # 3b — Get weights from HuggingFace (weights-only snapshot)
         try:
             from huggingface_hub import hf_hub_download
             with _SpinnerCtx("DepthPro · weights from HF     "):
@@ -412,7 +462,7 @@ class _DepthProWrapper:
 
         print(f"  {c['dim']}Weights: {ckpt_path}{c['reset']}")
 
-        # 3c — Load via importlib
+        # 3c — Load via importlib (pillow_heif stub already in sys.modules)
         try:
             with _SpinnerCtx("DepthPro · dynamic import      "):
                 depth_pro = _importlib_load_depth_pro(src_parent)
