@@ -1,22 +1,35 @@
 """
-NkVasi_SaveImageAlpha — saves IMAGE + MASK as PNG with true alpha channel.
+NkVasi_SaveImageAlpha — saves IMAGE + MASK as PNG with real alpha channel.
 
-ComfyUI's built-in Save Image node always converts to RGB (no transparency).
-This node merges the image and mask into a proper RGBA PNG.
+Behaviour by bg_mode:
+  alpha    — saves as RGBA PNG (transparent background)
+  any other— saves as RGB PNG (image already has background composited
+              by the Ensemble node — do NOT re-apply the mask or you lose
+              the background colour again)
+
+COMPATIBILITY NOTE
+  When using Remove BG Ensemble with background=alpha → connect both
+  image+mask outputs here and set bg_mode=alpha.
+  When using background=white/blue/etc. → connect only the image output
+  and set bg_mode=composited (or use any standard Save Image node).
 """
 import os
 import json
 import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
-import folder_paths  # ComfyUI built-in
+import folder_paths
+
+
+BG_MODES = ["alpha", "composited (solid/checker background)"]
 
 
 class NkVasi_SaveImageAlpha:
     """
-    Saves IMAGE + MASK as a PNG with a real alpha channel.
-    Connect the 'image' output and 'mask' output from Remove BG Ensemble
-    (or any other node) to get a proper transparent PNG.
+    Saves IMAGE (and optional MASK) as PNG.
+    • bg_mode=alpha          → RGBA PNG, mask used as alpha channel
+    • bg_mode=composited     → RGB  PNG, image saved as-is (background
+                               was already baked in by the Ensemble node)
     """
 
     CATEGORY = "🎭 nkVasi/Background Removal"
@@ -29,11 +42,15 @@ class NkVasi_SaveImageAlpha:
         return {
             "required": {
                 "image":           ("IMAGE",),
-                "mask":            ("MASK",),
                 "filename_prefix": ("STRING", {"default": "nkVasi_alpha"}),
+                "bg_mode":         (BG_MODES,  {"default": "alpha"}),
+            },
+            "optional": {
+                # mask is only used when bg_mode=alpha
+                "mask": ("MASK",),
             },
             "hidden": {
-                "prompt":    "PROMPT",
+                "prompt":       "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
             },
         }
@@ -41,39 +58,43 @@ class NkVasi_SaveImageAlpha:
     def save_image_alpha(
         self,
         image,
-        mask,
         filename_prefix="nkVasi_alpha",
+        bg_mode="alpha",
+        mask=None,
         prompt=None,
         extra_pnginfo=None,
     ):
         output_dir = folder_paths.get_output_directory()
-        results = []
+        results    = []
+        save_alpha = bg_mode.startswith("alpha")
 
         for i in range(image.shape[0]):
-            # Convert IMAGE tensor (H,W,3) -> uint8
-            img_np = (image[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img_np  = (image[i].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
             pil_rgb = Image.fromarray(img_np, mode="RGB")
 
-            # Convert MASK tensor (H,W) -> uint8 L
-            mask_i = mask[i] if mask.ndim == 3 else mask
-            mask_np = (mask_i.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            pil_alpha = Image.fromarray(mask_np, mode="L")
+            if save_alpha:
+                # Need a mask — use supplied mask or full-opaque fallback
+                if mask is not None:
+                    mask_i  = mask[i] if mask.ndim == 3 else mask
+                    mask_np = (mask_i.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    pil_a   = Image.fromarray(mask_np, mode="L")
+                    if pil_a.size != pil_rgb.size:
+                        pil_a = pil_a.resize(pil_rgb.size, Image.LANCZOS)
+                else:
+                    # No mask connected in alpha mode — full opaque
+                    pil_a = Image.new("L", pil_rgb.size, 255)
 
-            # Resize alpha to match image if different (e.g. from external mask node)
-            if pil_alpha.size != pil_rgb.size:
-                pil_alpha = pil_alpha.resize(pil_rgb.size, Image.LANCZOS)
+                r, g, b = pil_rgb.split()
+                pil_out = Image.merge("RGBA", (r, g, b, pil_a))
+            else:
+                # Composited mode: background is already baked into the RGB image
+                # Just save it as-is — do NOT touch the alpha channel
+                pil_out = pil_rgb
 
-            # Merge into RGBA
-            pil_rgba = pil_rgb.convert("RGBA")
-            r, g, b, _ = pil_rgba.split()
-            pil_rgba = Image.merge("RGBA", (r, g, b, pil_alpha))
-
-            # Build output filename with auto-increment
-            counter = _next_counter(output_dir, filename_prefix)
+            counter  = _next_counter(output_dir, filename_prefix)
             filename = f"{filename_prefix}_{counter:05d}.png"
             filepath = os.path.join(output_dir, filename)
 
-            # Embed workflow metadata (same as ComfyUI built-in)
             pnginfo = PngInfo()
             if prompt:
                 pnginfo.add_text("prompt", json.dumps(prompt))
@@ -81,23 +102,15 @@ class NkVasi_SaveImageAlpha:
                 for k, v in extra_pnginfo.items():
                     pnginfo.add_text(k, json.dumps(v))
 
-            pil_rgba.save(filepath, format="PNG", pnginfo=pnginfo, compress_level=6)
-
-            results.append({
-                "filename": filename,
-                "subfolder": "",
-                "type": "output",
-            })
+            pil_out.save(filepath, format="PNG", pnginfo=pnginfo, compress_level=6)
+            results.append({"filename": filename, "subfolder": "", "type": "output"})
 
         return {"ui": {"images": results}}
 
 
 def _next_counter(directory: str, prefix: str) -> int:
-    """Find the next unused integer counter for the given prefix."""
-    existing = [
-        f for f in os.listdir(directory)
-        if f.startswith(prefix) and f.endswith(".png")
-    ]
+    existing = [f for f in os.listdir(directory)
+                if f.startswith(prefix) and f.endswith(".png")]
     if not existing:
         return 1
     counters = []
