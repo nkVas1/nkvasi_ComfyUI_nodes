@@ -1,26 +1,22 @@
 """
-NkVasi_DepthGuide v2.0
+NkVasi_DepthGuide v2.1
 
 Depth Pro — guided mask refinement node.
 
-This node sits between RMBG_Ensemble and MattingRefine in the workflow:
-
+Workflow position:
   IMAGE ─┬─> RMBG_Ensemble ──> mask ──────────────────> DepthGuide ─> mask_refined ─> MattingRefine
          └────────────────────────────────────────────> DepthGuide
                                   confidence_map ─────────> DepthGuide (optional)
 
-What it does (v2)
------------------
-1. Runs Depth Pro on the input image — produces metric depth map.
-2. Polarity resolved via mask oracle (not centre/border heuristic).
-3. Four-pass refinement:
-   Pass 1  BG veto      — far-depth edge pixels suppressed
-   Pass 2  FG recovery  — near-depth pixels missed by ensemble recovered
-   Pass 3  Edge crisp   — depth-edge driven alpha sharpening at boundary
-   Pass 4  Hard lock    — safe-zone pixels snapped to ensemble values
-4. Adaptive trimap: depth gradient + missed-strands expansion gives
-   MattingRefine the best possible working zone.
-5. Outputs refined mask + depth map (visualised as MASK for debugging).
+v2.1 additions
+--------------
+  • BG hard cut: pixels where depth is very far + alpha still semi-transparent
+    are driven straight to alpha=0 (controlled by depth_bg_hard / bg_hard_cut_strength).
+    This eliminates stubborn fringe that soft suppression couldn't finish.
+  • Edge crisp cap raised to 1.0: at strength=1.0 the depth-edge decision
+    fully replaces ensemble alpha at strong depth boundaries.
+  • Tunable hard-lock threshold (hard_lock_hi): default 0.90 instead of
+    fixed 0.95 — lets BG veto reach deeper into semi-transparent fringe zones.
 """
 import torch
 import numpy as np
@@ -36,7 +32,7 @@ from ..utils.image_utils    import tensor_to_pil, pil_mask_to_tensor
 
 class NkVasi_DepthGuide:
     """
-    v2.0: Depth Pro guided mask refinement.
+    v2.1: Depth Pro guided mask refinement.
     Insert between RMBG_Ensemble and MattingRefine for best results.
     """
 
@@ -53,26 +49,39 @@ class NkVasi_DepthGuide:
                 "mask":  ("MASK",),
             },
             "optional": {
-                # Optional confidence from Ensemble for combined trimap
                 "confidence": ("MASK", {
                     "tooltip": "confidence_map from RMBG_Ensemble — combined with depth for better trimap"
                 }),
 
-                # --- Pass 1: BG suppression ---
+                # ── Pass 1: BG soft suppression ──────────────────────────
                 "bg_suppress_strength": ("FLOAT", {
                     "default": 0.70, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "How aggressively to push far-depth edge pixels toward BG"
+                    "tooltip": "Soft BG suppression strength — proportional alpha reduction for far-depth pixels"
                 }),
                 "fg_depth_percentile": ("FLOAT", {
                     "default": 80.0, "min": 50.0, "max": 99.0, "step": 1.0,
-                    "tooltip": "Percentile of FG depth used as BG threshold. Higher = more conservative"
+                    "tooltip": "Percentile of FG depth used as soft-BG threshold. Higher = more conservative"
                 }),
                 "depth_bg_threshold": ("FLOAT", {
                     "default": 0.75, "min": 0.50, "max": 1.00, "step": 0.01,
-                    "tooltip": "Normalised depth above which a pixel is considered definitely BG"
+                    "tooltip": "Soft-veto threshold: depth above this starts proportional suppression"
                 }),
 
-                # --- Pass 2: FG recovery ---
+                # ── Pass 1+: BG hard cut (NEW v2.1) ──────────────────────
+                "depth_bg_hard": ("FLOAT", {
+                    "default": 0.90, "min": 0.60, "max": 1.00, "step": 0.01,
+                    "tooltip": "Hard-cut threshold: depth above this drives alpha straight to 0. Lower = more aggressive"
+                }),
+                "bg_hard_cut_strength": ("FLOAT", {
+                    "default": 0.80, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Hard-cut strength. 0=disabled, 1=always zero out deep-BG pixels. Main control for stubborn fringe"
+                }),
+                "hard_cut_alpha_max": ("FLOAT", {
+                    "default": 0.70, "min": 0.10, "max": 1.00, "step": 0.05,
+                    "tooltip": "Only apply hard cut to pixels with alpha below this. Protects FG core from accidental erasure"
+                }),
+
+                # ── Pass 2: FG recovery ───────────────────────────────────
                 "depth_fg_threshold": ("FLOAT", {
                     "default": 0.35, "min": 0.05, "max": 0.60, "step": 0.01,
                     "tooltip": "Depth below which missed strands are eligible for FG recovery"
@@ -82,13 +91,19 @@ class NkVasi_DepthGuide:
                     "tooltip": "Maximum alpha to restore when recovering a missed FG strand"
                 }),
 
-                # --- Pass 3: Edge crisp ---
+                # ── Pass 3: Edge crisp ────────────────────────────────────
                 "edge_crisp_strength": ("FLOAT", {
                     "default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "How much to sharpen the alpha boundary using depth edges"
+                    "tooltip": "Depth-edge driven boundary sharpening. At 1.0 fully replaces ensemble alpha at depth contours"
                 }),
 
-                # --- Adaptive trimap from depth ---
+                # ── Pass 4: Hard lock threshold ───────────────────────────
+                "hard_lock_hi": ("FLOAT", {
+                    "default": 0.90, "min": 0.70, "max": 0.99, "step": 0.01,
+                    "tooltip": "Alpha above this is always locked to ensemble value. Lower = depth can suppress more fringe"
+                }),
+
+                # ── Adaptive trimap ───────────────────────────────────────
                 "use_depth_trimap": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Build adaptive trimap using depth gradient as boundary-complexity signal"
@@ -102,10 +117,10 @@ class NkVasi_DepthGuide:
                     "tooltip": "Max unknown-band half-width (hair / complex boundary)"
                 }),
 
-                # --- Output options ---
+                # ── Output ────────────────────────────────────────────────
                 "invert_depth_vis": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Invert depth_map output visualisation (near=white instead of near=dark)"
+                    "tooltip": "Invert depth_map visualisation (near=white instead of near=dark)"
                 }),
             },
         }
@@ -118,9 +133,13 @@ class NkVasi_DepthGuide:
         bg_suppress_strength=0.70,
         fg_depth_percentile=80.0,
         depth_bg_threshold=0.75,
+        depth_bg_hard=0.90,
+        bg_hard_cut_strength=0.80,
+        hard_cut_alpha_max=0.70,
         depth_fg_threshold=0.35,
         recovery_max=0.60,
         edge_crisp_strength=0.50,
+        hard_lock_hi=0.90,
         use_depth_trimap=True,
         trimap_min_px=4,
         trimap_max_px=24,
@@ -136,9 +155,8 @@ class NkVasi_DepthGuide:
             m_np    = mask[i].cpu().numpy().astype(np.float32)
 
             # ---- 1. Run Depth Pro ----
-            depth_norm = depth_model.infer(pil_img)   # float32 H×W [0=near,1=far]
+            depth_norm = depth_model.infer(pil_img)
 
-            # Resize depth to mask resolution
             if depth_norm.shape != m_np.shape:
                 d_pil      = Image.fromarray(
                     (depth_norm * 255).clip(0, 255).astype(np.uint8), mode="L")
@@ -158,15 +176,19 @@ class NkVasi_DepthGuide:
                         c_pil.resize((m_np.shape[1], m_np.shape[0]), Image.LANCZOS)
                     ).astype(np.float32) / 255.0
 
-            # ---- 3. Depth-guided mask refinement (v2 four-pass) ----
+            # ---- 3. Depth-guided mask refinement (v2.1 five-pass) ----
             m_refined = depth_guided_mask(
                 m_np, depth_norm,
                 strength=bg_suppress_strength,
                 fg_percentile=fg_depth_percentile,
                 depth_bg_suppress=depth_bg_threshold,
-                depth_fg_recover=depth_fg_threshold,   # v2: was depth_fg_boost
+                depth_bg_hard=depth_bg_hard,
+                bg_hard_cut_strength=bg_hard_cut_strength,
+                hard_cut_alpha_max=hard_cut_alpha_max,
+                depth_fg_recover=depth_fg_threshold,
                 recovery_max=recovery_max,
                 edge_crisp_strength=edge_crisp_strength,
+                hard_lock_hi=hard_lock_hi,
             )
 
             # ---- 4. Adaptive trimap baked into refined mask ----
@@ -178,8 +200,6 @@ class NkVasi_DepthGuide:
                     max_band_px=trimap_max_px,
                     fg_percentile=fg_depth_percentile,
                 )
-                # Blend trimap signal: unknown zone (128) → use refined,
-                # definite FG/BG → snap to hard values
                 t_norm   = trimap.astype(np.float32) / 255.0
                 hard_fg  = t_norm >= 0.9
                 hard_bg  = t_norm <= 0.1
@@ -187,10 +207,9 @@ class NkVasi_DepthGuide:
                 m_refined[hard_bg] = np.minimum(m_refined[hard_bg], 0.05)
                 m_refined = np.clip(m_refined, 0.0, 1.0)
 
-            # ---- 5. Depth visualisation output ----
+            # ---- 5. Depth visualisation ----
             vis = 1.0 - depth_norm if invert_depth_vis else depth_norm
             depth_pil = depth_to_pil(vis)
-            # Resize to original image size for display
             orig_w, orig_h = pil_img.size
             depth_pil = depth_pil.resize((orig_w, orig_h), Image.LANCZOS)
             mask_pil  = Image.fromarray(
