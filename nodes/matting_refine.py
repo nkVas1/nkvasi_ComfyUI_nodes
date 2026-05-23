@@ -1,14 +1,16 @@
 """
-NkVasi_MattingRefine v3.3
+NkVasi_MattingRefine v3.4
+
+New in v3.4:
+  - Updated defaults to best-tested values:
+    lock_fg=0.75, lock_bg=0.05, channel_boost=1.00,
+    trimap_band_px=4, trimap_max_px=20, edge_strength=0.50,
+    coarse_radius=1, fine_blend=1.00, fringe_suppress=1.00
+  - confidence_threshold default changed to 0.75
 
 New in v3.3:
-  - confidence input (optional): accepts the confidence_map output from
-    RMBG_Ensemble.  When connected, the matting engine processes ONLY pixels
-    where confidence < confidence_threshold, skipping already-certain areas.
-    This makes matting faster AND more accurate (no over-processing of flat BG).
-  - Adaptive trimap: when confidence is connected, trimap_band_px is modulated
-    per-pixel by (1 - confidence), giving a wide unknown band at hair edges
-    and a narrow one in flat confident regions.
+  - confidence input from RMBG_Ensemble restricts matting to uncertain zones.
+  - Adaptive trimap: per-pixel band width from confidence.
 """
 import torch
 import numpy as np
@@ -31,7 +33,7 @@ except ImportError:
 
 class NkVasi_MattingRefine:
     """
-    v3.3: Confidence-aware matting — connect confidence_map from Ensemble to
+    v3.4: Best-tested defaults. Connect confidence_map from Ensemble to
     focus the matting engine only on uncertain edge zones.
     """
 
@@ -48,38 +50,23 @@ class NkVasi_MattingRefine:
                 "mask":  ("MASK",),
             },
             "optional": {
-                # ---- Confidence input from Ensemble ----
-                "confidence":          ("MASK", {"tooltip": "Connect confidence_map from RMBG_Ensemble. Restricts matting to uncertain zones only."}),
-                "confidence_threshold":("FLOAT", {"default": 0.85, "min": 0.50, "max": 1.00, "step": 0.01,
-                                                   "tooltip": "Pixels with confidence >= this are skipped by the matting engine"}),
-
-                # ---- Lock zones ----
-                "lock_fg":         ("FLOAT", {"default": 0.92, "min": 0.50, "max": 1.00, "step": 0.01}),
-                "lock_bg":         ("FLOAT", {"default": 0.04, "min": 0.00, "max": 0.40, "step": 0.01}),
-
-                # ---- Channel Boost ----
-                "channel_boost":   ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
-
-                # ---- Adaptive trimap ----
-                "trimap_band_px":  ("INT",   {"default": 8,  "min": 2,  "max": 40, "step": 2,
-                                              "tooltip": "Base unknown-band radius. When confidence is connected, this becomes the MIN band width"}),
-                "trimap_max_px":   ("INT",   {"default": 24, "min": 6,  "max": 60, "step": 2,
-                                              "tooltip": "Max band width used in low-confidence zones (only active when confidence input connected)"}),
-                "edge_strength":   ("FLOAT", {"default": 0.70, "min": 0.0, "max": 1.0, "step": 0.05}),
-
-                # ---- Guided filter fallback ----
-                "coarse_radius":   ("INT",   {"default": 4, "min": 1, "max": 40, "step": 1}),
-                "fine_radius":     ("INT",   {"default": 1, "min": 1, "max": 6,  "step": 1}),
-                "fine_blend":      ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
-
-                # ---- Final edge smoothing ----
-                "smooth_edges":    ("INT",   {"default": 1, "min": 0, "max": 3, "step": 1}),
-
-                # ---- BG fringe suppression ----
-                "fringe_suppress": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.05}),
-
-                # ---- Foreground decontamination ----
-                "decontaminate":   ("BOOLEAN", {"default": True}),
+                "confidence":           ("MASK",  {"tooltip": "confidence_map from RMBG_Ensemble — restricts matting to uncertain zones"}),
+                "confidence_threshold": ("FLOAT", {"default": 0.75, "min": 0.50, "max": 1.00, "step": 0.01,
+                                                    "tooltip": "Pixels with confidence >= this are skipped by the matting engine"}),
+                "lock_fg":          ("FLOAT", {"default": 0.75, "min": 0.50, "max": 1.00, "step": 0.01}),
+                "lock_bg":          ("FLOAT", {"default": 0.05, "min": 0.00, "max": 0.40, "step": 0.01}),
+                "channel_boost":    ("FLOAT", {"default": 1.00, "min": 0.0,  "max": 1.0,  "step": 0.05}),
+                "trimap_band_px":   ("INT",   {"default": 4,   "min": 2,  "max": 40, "step": 2,
+                                               "tooltip": "Base unknown-band radius. With confidence input = MIN width"}),
+                "trimap_max_px":    ("INT",   {"default": 20,  "min": 6,  "max": 60, "step": 2,
+                                               "tooltip": "Max band width in low-confidence zones"}),
+                "edge_strength":    ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "coarse_radius":    ("INT",   {"default": 1,   "min": 1,  "max": 40, "step": 1}),
+                "fine_radius":      ("INT",   {"default": 1,   "min": 1,  "max": 6,  "step": 1}),
+                "fine_blend":       ("FLOAT", {"default": 1.00, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "smooth_edges":     ("INT",   {"default": 1,   "min": 0,  "max": 3,  "step": 1}),
+                "fringe_suppress":  ("FLOAT", {"default": 1.00, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "decontaminate":    ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -88,18 +75,18 @@ class NkVasi_MattingRefine:
         image,
         mask,
         confidence=None,
-        confidence_threshold=0.85,
-        lock_fg=0.92,
-        lock_bg=0.04,
-        channel_boost=0.20,
-        trimap_band_px=8,
-        trimap_max_px=24,
-        edge_strength=0.70,
-        coarse_radius=4,
+        confidence_threshold=0.75,
+        lock_fg=0.75,
+        lock_bg=0.05,
+        channel_boost=1.00,
+        trimap_band_px=4,
+        trimap_max_px=20,
+        edge_strength=0.50,
+        coarse_radius=1,
         fine_radius=1,
-        fine_blend=0.35,
+        fine_blend=1.00,
         smooth_edges=1,
-        fringe_suppress=0.15,
+        fringe_suppress=1.00,
         decontaminate=True,
     ):
         out_masks, out_images = [], []
@@ -117,7 +104,6 @@ class NkVasi_MattingRefine:
             if confidence is not None:
                 conf_idx = min(i, confidence.shape[0] - 1)
                 conf_np  = confidence[conf_idx].cpu().numpy().astype(np.float32)
-                # resize confidence to mask resolution if needed
                 if conf_np.shape != original.shape:
                     from PIL import Image as _PIL
                     conf_pil = _PIL.fromarray(
@@ -134,7 +120,7 @@ class NkVasi_MattingRefine:
             if channel_boost > 0.0:
                 m_np = _channel_boost(m_np, guide_np, lock_bg, lock_fg, channel_boost)
 
-            # ---- 2. Build trimap (adaptive if confidence available) ----
+            # ---- 2. Build trimap ----
             if conf_np is not None:
                 trimap = build_adaptive_trimap(
                     m_np, conf_np,
@@ -226,20 +212,15 @@ def _pymatting_alpha(guide_np, mask, trimap, edge_strength, conf_np, conf_thresh
     trimap_pm = trimap.astype(np.float32) / 255.0
     trimap_pm = np.where(trimap_pm < 0.3, 0.0,
                 np.where(trimap_pm > 0.7, 1.0, 0.5))
-
-    # When confidence is connected: skip pixels where conf >= threshold
-    # by forcing them to definite FG or BG in the trimap
     if conf_np is not None:
         certain = conf_np >= conf_thresh
         trimap_pm[certain & (mask >= 0.5)] = 1.0
         trimap_pm[certain & (mask <  0.5)] = 0.0
-
     try:
         alpha_cf = estimate_alpha_cf(guide_np, trimap_pm)
         alpha_cf = np.clip(alpha_cf, 0.0, 1.0).astype(np.float32)
     except Exception:
         return mask.copy()
-
     unknown = trimap_pm == 0.5
     result  = mask.copy()
     result[unknown] = (
@@ -259,7 +240,6 @@ def _guided_filter_alpha(mask, guide, coarse_radius, fine_radius, fine_blend,
     fine    = guided_filter_mask(mask, guide, radius=fine_radius,   eps=1e-5)
     blended = np.clip((1.0 - fine_blend) * coarse + fine_blend * fine, 0.0, 1.0)
     edge_band = (mask > lock_bg) & (mask < lock_fg)
-    # Gate: skip confident pixels
     if conf_np is not None:
         edge_band = edge_band & (conf_np < conf_thresh)
     result    = mask.copy()

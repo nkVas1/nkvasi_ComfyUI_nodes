@@ -1,22 +1,15 @@
 """
-NkVasi_RMBG_Ensemble v2.0 — multi-model ensemble for maximum precision.
+NkVasi_RMBG_Ensemble v2.1 — multi-model ensemble for maximum precision.
+
+New in v2.1:
+  - Updated defaults to best-tested values (soft_intersection, trimap 4/24).
+  - bg_color_suppress: automatically detects uniform backgrounds (blue sky,
+    studio colour, etc.) and aggressively removes residual BG colour fringe
+    from alpha edges — without touching subject areas with similar colour.
 
 New in v2.0:
   - Confidence Map output: per-pixel agreement between models exported as MASK.
-    High value (white) = models agree = safe zone.
-    Low value (black)  = models disagree = edge / uncertain zone.
-    Connect this output to MattingRefine's `confidence` input to restrict
-    the matting engine to ONLY the uncertain zone — faster and more accurate.
-  - Adaptive Trimap mode: automatically widens the unknown band in uncertain
-    and high-curvature regions, narrows it in confident flat-BG areas.
-    Enabled by default; can be turned off with adaptive_trimap=False.
-
-Merge modes:
-  weighted_avg      — smooth weighted average
-  consensus         — mean × √(fraction_models_agree); best all-around
-  soft_intersection — geometric mean; penalises uncertain pixels
-  intersection      — min across all models (strictest)
-  union             — max across all models (most inclusive)
+  - Adaptive Trimap mode.
 """
 import torch
 import numpy as np
@@ -34,14 +27,15 @@ from ..utils.mask_ops import (
     adaptive_bg_cleanup, feather_mask,
 )
 from ..utils.confidence import (
-    confidence_weighted_merge, build_confidence_map,
+    confidence_weighted_merge,
     build_adaptive_trimap, confidence_to_pil,
 )
+from ..utils.bg_color_suppress import auto_bg_color_suppress
 
 MERGE_MODES = [
-    "weighted_avg",
-    "consensus (recommended)",
     "soft_intersection",
+    "consensus (recommended)",
+    "weighted_avg",
     "intersection (strictest)",
     "union (most inclusive)",
 ]
@@ -87,10 +81,8 @@ def _merge_masks(masks: list, weights: list, mode: str) -> np.ndarray:
 
 class NkVasi_RMBG_Ensemble:
     """
-    v2.0: Multi-model ensemble BG removal with Confidence Map output
-    and Adaptive Trimap.
-    Chain with MattingRefine for best results — pass confidence_map output
-    into MattingRefine's confidence input to focus matting only where needed.
+    v2.1: Best-tested defaults + bg_color_suppress for uniform backgrounds.
+    Connect confidence_map → MattingRefine for optimal hair detail.
     """
 
     CATEGORY = "🎭 nkVasi/Background Removal"
@@ -107,10 +99,10 @@ class NkVasi_RMBG_Ensemble:
                 "use_birefnet_matting": ("BOOLEAN", {"default": True}),
                 "use_ben2":             ("BOOLEAN", {"default": True}),
                 "use_rmbg2":            ("BOOLEAN", {"default": False}),
-                "merge_mode":         (MERGE_MODES, {"default": "consensus (recommended)"}),
-                "process_resolution": ("INT", {"default": 2048, "min": 512, "max": 2048, "step": 128}),
-                "background":         (BACKGROUNDS, {"default": "alpha"}),
-                "hair_mode":          ("BOOLEAN", {"default": True}),
+                "merge_mode":           (MERGE_MODES, {"default": "soft_intersection"}),
+                "process_resolution":   ("INT",  {"default": 2048, "min": 512, "max": 2048, "step": 128}),
+                "background":           (BACKGROUNDS, {"default": "alpha"}),
+                "hair_mode":            ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "birefnet_hr_weight":      ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
@@ -126,12 +118,21 @@ class NkVasi_RMBG_Ensemble:
                 "refine_foreground": ("BOOLEAN", {"default": True}),
                 "fp16":              ("BOOLEAN", {"default": True}),
                 # --- Adaptive trimap ---
-                "adaptive_trimap":   ("BOOLEAN", {"default": True,
-                                                   "tooltip": "Widen unknown band near uncertain/complex edges, narrow it elsewhere"}),
-                "trimap_min_px":     ("INT",     {"default": 4,  "min": 2,  "max": 20, "step": 1,
-                                                   "tooltip": "Min unknown-band half-width (confident flat areas)"}),
-                "trimap_max_px":     ("INT",     {"default": 24, "min": 6,  "max": 60, "step": 2,
-                                                   "tooltip": "Max unknown-band half-width (hair / uncertain edges)"}),
+                "adaptive_trimap": ("BOOLEAN", {"default": True,
+                                     "tooltip": "Widen unknown band near uncertain/complex edges"}),
+                "trimap_min_px":   ("INT", {"default": 4,  "min": 2, "max": 20, "step": 1,
+                                     "tooltip": "Min band width (confident flat areas)"}),
+                "trimap_max_px":   ("INT", {"default": 24, "min": 6, "max": 60, "step": 2,
+                                     "tooltip": "Max band width (hair / uncertain edges)"}),
+                # --- BG color suppression ---
+                "bg_color_suppress":      ("BOOLEAN", {"default": True,
+                                            "tooltip": "Auto-detect uniform BG colour (sky, studio) and remove colour fringe from edges"}),
+                "bg_suppress_strength":   ("FLOAT",   {"default": 0.65, "min": 0.0, "max": 1.0, "step": 0.05,
+                                            "tooltip": "Suppression intensity. 0=off, 1=maximum"}),
+                "bg_suppress_fg_overlap": ("FLOAT",   {"default": 0.25, "min": 0.05, "max": 0.60, "step": 0.05,
+                                            "tooltip": "Safety: skip suppression if >X fraction of subject contains BG colour"}),
+                "bg_hue_std_thresh":      ("FLOAT",   {"default": 0.06, "min": 0.02, "max": 0.20, "step": 0.01,
+                                            "tooltip": "Max hue stddev to consider BG uniform. Lower = stricter detection"}),
             },
         }
 
@@ -161,11 +162,15 @@ class NkVasi_RMBG_Ensemble:
         adaptive_trimap=True,
         trimap_min_px=4,
         trimap_max_px=24,
+        bg_color_suppress=True,
+        bg_suppress_strength=0.65,
+        bg_suppress_fg_overlap=0.25,
+        bg_hue_std_thresh=0.06,
     ):
-        results_img   = []
-        results_mask  = []
-        results_conf  = []
-        merge_res     = process_resolution
+        results_img  = []
+        results_mask = []
+        results_conf = []
+        merge_res    = process_resolution
 
         for i in range(image.shape[0]):
             pil_img        = tensor_to_pil(image[i])
@@ -201,10 +206,6 @@ class NkVasi_RMBG_Ensemble:
 
             # ---- Merge + Confidence Map ----
             merged, confidence = confidence_weighted_merge(masks, weights)
-
-            # Override merged with consensus/intersection/union if requested
-            # (confidence_weighted_merge always uses weighted_avg for the merged output;
-            #  re-merge with the requested mode if different)
             if not merge_mode.startswith("weighted_avg"):
                 merged = _merge_masks(masks, weights, merge_mode)
 
@@ -213,7 +214,7 @@ class NkVasi_RMBG_Ensemble:
             merged = np.clip(
                 (merged - (thresh - 0.5)) / (1.0 - thresh + 0.15), 0.0, 1.0)
 
-            # ---- Guided filter (anti-alias corrected float guide) ----
+            # ---- Guided filter ----
             merged = guided_filter_mask(merged, guide_np, radius=7, eps=3e-4)
 
             # ---- BG cleanup ----
@@ -226,25 +227,26 @@ class NkVasi_RMBG_Ensemble:
 
             if artefact_size > 0:
                 merged = soft_remove_islands(merged, min_island_size=artefact_size)
-
             merged = soft_remove_holes(merged, min_hole_size=600)
 
+            # ---- BG Color Suppression (uniform sky / studio BG) ----
+            if bg_color_suppress and bg_suppress_strength > 0.0:
+                merged, _bg_info = auto_bg_color_suppress(
+                    merged, guide_np,
+                    strength=bg_suppress_strength,
+                    max_fg_overlap=bg_suppress_fg_overlap,
+                    lock_bg=bg_cleanup_thresh,
+                    lock_fg=0.92,
+                    hue_std_thresh=bg_hue_std_thresh,
+                )
+
             # ---- Adaptive Trimap baked into confidence output ----
-            # We expose the adaptive trimap as part of confidence_map so that
-            # MattingRefine can consume it without extra nodes.
-            # The actual trimap is built here for reference / downstream use;
-            # MattingRefine uses the confidence mask directly to adapt its own
-            # trimap_band_px per-pixel.
             if adaptive_trimap:
                 _trimap = build_adaptive_trimap(
                     merged, confidence,
                     min_band_px=trimap_min_px,
                     max_band_px=trimap_max_px,
                 )
-                # Encode trimap into confidence_map output:
-                # unknown zone (128) → 0.5, FG (255) → 1.0, BG (0) → 0.0
-                # This makes the output directly usable as a visual debug mask
-                # AND as a signal for MattingRefine.
                 conf_out = _trimap.astype(np.float32) / 255.0
             else:
                 conf_out = confidence
@@ -257,7 +259,7 @@ class NkVasi_RMBG_Ensemble:
             if mask_blur > 0:
                 merged = smooth_mask(merged, mask_blur)
 
-            # ---- Resize outputs to original resolution ----
+            # ---- Resize to original ----
             mask_final_pil = Image.fromarray(
                 (merged * 255).clip(0, 255).astype(np.uint8), mode="L"
             ).resize((orig_w, orig_h), Image.LANCZOS)
