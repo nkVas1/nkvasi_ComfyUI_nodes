@@ -257,20 +257,13 @@ class _InSPyReNetWrapper:
 # ==========================================================================
 # Depth Pro wrapper  (Apple MLRC, 2024)
 #
-# The HuggingFace repo apple/DepthPro is WEIGHTS-ONLY (depth_pro.pt + README).
-# Python source lives at https://github.com/apple/ml-depth-pro
+# HF repo apple/DepthPro — weights only (depth_pro.pt).
+# Source: https://github.com/apple/ml-depth-pro
 #
-# depth_pro/__init__.py exports ONLY:
-#   create_model_and_transforms, load_rgb
-# DepthProConfig lives in depth_pro/depth_pro.py (the submodule).
-#
-# Loading strategies:
-#   1. depth_pro already installed as pip package
-#   2. transformers AutoModelForDepthEstimation (falls back gracefully)
-#   3a. Download source ZIP from GitHub → extract to .cache/depth_pro_src/
-#   3b. Patch optional dependencies (pillow_heif etc.) in extracted source
-#   3c. Download weights via hf_hub_download
-#   3d. Load package + submodule via importlib, pass ckpt_path to config
+# depth_pro/__init__.py exports ONLY create_model_and_transforms + load_rgb.
+# DepthProConfig is a @dataclass in depth_pro/depth_pro.py with 3 required
+# positional fields. DEFAULT_MONODEPTH_CONFIG_DICT provides all defaults;
+# we use dataclasses.replace() to override only checkpoint_uri.
 # ==========================================================================
 
 _DEPTH_PRO_GITHUB_ZIP = (
@@ -351,19 +344,15 @@ def _ensure_depth_pro_src() -> str:
 
 def _importlib_load_depth_pro(src_parent: str):
     """
-    Load the depth_pro package from src_parent via importlib.
-    Also explicitly loads the depth_pro.depth_pro submodule so that
-    DepthProConfig and create_model_and_transforms are fully available.
-    Returns the top-level depth_pro module.
+    Load depth_pro package and its depth_pro.depth_pro submodule via importlib.
+    Returns the top-level package module.
     """
     import importlib.util
 
-    # Purge any stale entries
     for key in list(sys.modules.keys()):
         if key == "depth_pro" or key.startswith("depth_pro."):
             del sys.modules[key]
 
-    # Pre-register pillow_heif stub so submodules that import it don't crash
     if "pillow_heif" not in sys.modules:
         try:
             import pillow_heif  # noqa: F401
@@ -378,15 +367,13 @@ def _importlib_load_depth_pro(src_parent: str):
     def _load_submodule(name: str, rel_path: str):
         path = os.path.join(dp_dir, rel_path)
         spec = importlib.util.spec_from_file_location(
-            name, path,
-            submodule_search_locations=[dp_dir],
+            name, path, submodule_search_locations=[dp_dir]
         )
         mod = importlib.util.module_from_spec(spec)
         sys.modules[name] = mod
         spec.loader.exec_module(mod)
         return mod
 
-    # 1. Load package root (__init__.py)
     init_spec = importlib.util.spec_from_file_location(
         "depth_pro",
         os.path.join(dp_dir, "__init__.py"),
@@ -396,11 +383,10 @@ def _importlib_load_depth_pro(src_parent: str):
     sys.modules["depth_pro"] = pkg
     init_spec.loader.exec_module(pkg)
 
-    # 2. Explicitly load depth_pro.depth_pro submodule (contains DepthProConfig)
-    #    This is needed because __init__.py only re-exports create_model_and_transforms
-    #    but DepthProConfig is defined in the submodule itself.
+    # Explicitly load depth_pro.depth_pro (contains DepthProConfig +
+    # DEFAULT_MONODEPTH_CONFIG_DICT). Attach as pkg.depth_pro for easy access.
     dp_sub = _load_submodule("depth_pro.depth_pro", "depth_pro.py")
-    pkg.depth_pro = dp_sub  # attach as attribute for convenience
+    pkg.depth_pro = dp_sub
 
     return pkg
 
@@ -471,14 +457,16 @@ class _DepthProWrapper:
         print(f"  {c['dim']}Weights: {ckpt_path}{c['reset']}")
 
         # 3d — Load via importlib.
-        # DepthProConfig lives in depth_pro.depth_pro submodule, not in package root.
-        # create_model_and_transforms accepts a config kwarg with checkpoint_uri.
+        # DepthProConfig is a @dataclass with 3 required positional args.
+        # Apple provides DEFAULT_MONODEPTH_CONFIG_DICT with all values filled in.
+        # We use dataclasses.replace() to swap only checkpoint_uri.
         try:
             with _SpinnerCtx("DepthPro · dynamic import      "):
+                import dataclasses
                 dp_pkg = _importlib_load_depth_pro(src_parent)
-                # DepthProConfig is in the submodule, attached as pkg.depth_pro
-                DepthProConfig = dp_pkg.depth_pro.DepthProConfig
-                cfg = DepthProConfig(checkpoint_uri=ckpt_path)
+                dp_sub  = dp_pkg.depth_pro  # depth_pro.depth_pro submodule
+                default_cfg = dp_sub.DEFAULT_MONODEPTH_CONFIG_DICT
+                cfg = dataclasses.replace(default_cfg, checkpoint_uri=ckpt_path)
                 self._model, self._transform = \
                     dp_pkg.create_model_and_transforms(config=cfg)
                 self._model.eval()
