@@ -1,0 +1,10 @@
+Copyright (c) 2026 Nikita Vasiliuk (github.com/nkVasi). All rights reserved.
+
+This source code and all associated files are the proprietary and confidential
+property of Nikita Vasiliuk. The software is provided for internal use only.
+
+Unauthorized copying, reproduction, modification, distribution, sublicensing,
+or any other use of this software, in whole or in part, via any medium, is
+strictly prohibited without the express prior written permission of the author.
+
+For licensing inquiries, contact the author via GitHub: https://github.com/nkVasi
