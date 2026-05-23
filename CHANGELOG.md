@@ -1,37 +1,43 @@
 # Changelog
 
+## [0.4.0] — 2026-05-23
+### Fixed
+- `hair_bg_island_removal`: was using `thresh=0.5` to binarise — missed all
+  semi-opaque BG patches (values 0.25–0.45) left by guided filter.
+  Now uses `detect_thresh=0.25` + closes the loose FG hull to limit search area.
+- `union` merge mode was identical to `max` — both computed `np.maximum.reduce`.
+  `union` is now correctly `max over all masks`; old `max (aggressive)` removed.
+- `feather_mask` formula corrected; was accidentally zeroing out exterior pixels.
+
+### Added
+- `consensus` merge mode: `mean(masks) × √fraction_models_agree`.
+  Best all-around mode — keeps hair detail while removing background leaks.
+  Set as new default merge mode.
+- `soft_intersection` merge mode: geometric mean of all masks.
+  Penalises low-confidence pixels without hard intersection cutoff.
+- `NkVasi_AlphaPreview` node: composites IMAGE+MASK over adjustable
+  checkerboard for instant alpha quality preview in ComfyUI.
+- `island_size` and `color_thresh` exposed as UI params in Ensemble node
+  for per-image fine-tuning.
+
 ## [0.3.0] — 2026-05-23
 ### Added
-- **Soft alpha pipeline** — all mask operations now preserve semi-transparent edge pixels;
-  hair/fur edges output real partial opacity instead of binary cut
-- `hair_bg_island_removal()` — colour-distance-gated removal of background patches
-  between hair strands; patches similar in colour to adjacent hair are kept semi-transparent
-- `soft_remove_holes()` / `soft_remove_islands()` — morphological cleanup that operates
-  on binary analysis but applies results as multipliers on the soft float mask
-- `NkVasi_SaveImageAlpha` node — saves IMAGE + MASK as proper RGBA PNG with transparency;
-  embeds workflow metadata like the built-in Save Image node
-- `guided_filter_mask()` now uses full RGB guide (3-channel) for better edge detection
-- `NkVasi_MaskRefine` now accepts optional IMAGE input to enable guided filter refinement
+- Soft alpha pipeline — semi-transparent hair edges
+- `hair_bg_island_removal()` with colour-distance gating
+- `soft_remove_holes()` / `soft_remove_islands()`
+- `NkVasi_SaveImageAlpha` node — real RGBA PNG output
+- `NkVasi_MaskRefine` now accepts IMAGE for guided filter refinement
 
 ### Changed
-- `rmbg_ensemble.py` post-processing pipeline fully rewritten (7 documented steps)
-- Default `process_resolution` raised 1024 → 1536 (BiRefNet-HR full quality)
-- Default `feather_edges` changed 0 → 2 (soft transition on all outputs by default)
-- Default `sensitivity` changed 0.5 → 0.45 (retain more semi-transparent hair pixels)
-- `refine_foreground_colors()` rewritten with per-pixel BG estimation via large-kernel blur;
-  `strength` parameter added (default 0.60); removes white halo on bright backgrounds
-- `NkVasi_MaskRefine` default `threshold` changed 0.5 → 0.0 (pass-through soft mask)
+- `process_resolution` default 1024 → 1536
+- `feather_edges` default 0 → 2
+- `sensitivity` default 0.5 → 0.45
+- `refine_foreground_colors` rewritten with per-pixel BG estimation
 
 ### Fixed
-- `guided_filter_mask()` crash — added `np.ascontiguousarray` on both arrays before
-  passing to `cv2.ximgproc.guidedFilter` (OpenCV assertion `-215`)
-- `except` clause widened to `(AttributeError, cv2.error)` for robust bilateral fallback
+- `guided_filter_mask` OpenCV assertion `-215` via `np.ascontiguousarray`
 
 ## [0.1.0] — 2026-05-23
 ### Added
-- `NkVasi_RMBG_Node` — single-model background removal
-- `NkVasi_RMBG_Ensemble` — multi-model ensemble
-- `NkVasi_MaskRefine` — standalone mask post-processing
-- `NkVasi_MaskTools` — apply mask to image with background options
-- Foreground color estimation, FP16 support, checkerboard background
-- Lazy model loading with in-process caching
+- `NkVasi_RMBG_Node`, `NkVasi_RMBG_Ensemble`, `NkVasi_MaskRefine`,
+  `NkVasi_MaskTools`, foreground decontamination, FP16, lazy model loading
