@@ -14,8 +14,8 @@ from ..utils.image_utils import (
     refine_foreground_colors,
 )
 from ..utils.mask_ops import (
-    smooth_mask, erode_expand_mask,
-    remove_small_holes, remove_small_islands,
+    smooth_mask, erode_expand_mask, guided_filter_mask,
+    remove_small_holes, remove_small_islands, feather_mask,
 )
 
 MERGE_MODES = [
@@ -31,9 +31,8 @@ BACKGROUNDS = ["alpha", "white", "black", "green", "red", "blue", "checkerboard"
 def _mask_pil_to_np(mask_pil: Image.Image, target_size: int) -> np.ndarray:
     """
     Convert any PIL mask to a normalised float32 numpy array
-    at a fixed (target_size x target_size) resolution.
-    This guarantees all masks have identical shapes before merging,
-    regardless of what internal resolution each model used.
+    at a fixed (target_size × target_size) resolution.
+    Guarantees all masks have identical shapes before merging.
     """
     resized = mask_pil.convert("L").resize((target_size, target_size), Image.LANCZOS)
     return np.array(resized).astype(np.float32) / 255.0
@@ -52,24 +51,30 @@ class NkVasi_RMBG_Ensemble:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "use_birefnet_hr": ("BOOLEAN", {"default": True}),
-                "use_birefnet_matting": ("BOOLEAN", {"default": True}),
-                "use_ben2": ("BOOLEAN", {"default": True}),
-                "use_rmbg2": ("BOOLEAN", {"default": False}),
-                "merge_mode": (MERGE_MODES, {"default": "weighted_avg (recommended)"}),
-                "process_resolution": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 128}),
+                "use_birefnet_hr":       ("BOOLEAN", {"default": True}),
+                "use_birefnet_matting":  ("BOOLEAN", {"default": True}),
+                "use_ben2":              ("BOOLEAN", {"default": True}),
+                "use_rmbg2":             ("BOOLEAN", {"default": False}),
+                "merge_mode":  (MERGE_MODES, {"default": "weighted_avg (recommended)"}),
+                # 1536 gives BiRefNet-HR its full potential on portrait photos;
+                # use 1024 if VRAM is limited, 2048 for maximum quality
+                "process_resolution": ("INT", {"default": 1536, "min": 512, "max": 2048, "step": 128}),
                 "background": (BACKGROUNDS, {"default": "alpha"}),
+                # hair_mode disables island removal and activates guided filter post-pass
+                # — critical for portraits with flyaway strands
+                "hair_mode":  ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "birefnet_hr_weight": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "birefnet_hr_weight":      ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "birefnet_matting_weight": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "ben2_weight": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "rmbg2_weight": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "mask_blur": ("INT", {"default": 1, "min": 0, "max": 32, "step": 1}),
-                "mask_offset": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1}),
-                "sensitivity": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "ben2_weight":             ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "rmbg2_weight":            ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "mask_blur":    ("INT",   {"default": 1, "min": 0, "max": 32, "step": 1}),
+                "mask_offset":  ("INT",   {"default": 0, "min": -20, "max": 20, "step": 1}),
+                "feather_edges":("INT",   {"default": 0, "min": 0,   "max": 32, "step": 1}),
+                "sensitivity":  ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "refine_foreground": ("BOOLEAN", {"default": True}),
-                "fp16": ("BOOLEAN", {"default": True}),
+                "fp16":              ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -83,31 +88,27 @@ class NkVasi_RMBG_Ensemble:
         merge_mode,
         process_resolution,
         background,
+        hair_mode=True,
         birefnet_hr_weight=0.40,
         birefnet_matting_weight=0.35,
         ben2_weight=0.25,
         rmbg2_weight=0.20,
         mask_blur=1,
         mask_offset=0,
+        feather_edges=0,
         sensitivity=0.5,
         refine_foreground=True,
         fp16=True,
     ):
         results_img = []
         results_mask = []
-
-        # Merge resolution: use process_resolution as the canonical grid.
-        # Every model's output is resized to this before blending —
-        # this prevents numpy broadcast errors when models return
-        # different native sizes (e.g. BiRefNet-HR=2048, BEN2=1024).
         merge_res = process_resolution
 
         for i in range(image.shape[0]):
             pil_img = tensor_to_pil(image[i])
             orig_w, orig_h = pil_img.size
 
-            masks = []
-            weights = []
+            masks, weights = [], []
 
             if use_birefnet_hr:
                 m = load_birefnet("HR").infer(pil_img, process_resolution, fp16)
@@ -132,44 +133,56 @@ class NkVasi_RMBG_Ensemble:
             if not masks:
                 raise ValueError("At least one model must be enabled in the Ensemble node.")
 
-            # ---- merge (all masks are now merge_res x merge_res) ----
+            # ---- merge (all masks are merge_res × merge_res) ----
             mode = merge_mode.split(" ")[0]
             if mode == "weighted_avg":
                 total_w = sum(weights)
                 merged = sum(m * w for m, w in zip(masks, weights)) / total_w
             elif mode == "intersection":
                 merged = masks[0]
-                for m in masks[1:]:
-                    merged = np.minimum(merged, m)
+                for m in masks[1:]: merged = np.minimum(merged, m)
             elif mode == "union":
                 merged = masks[0]
-                for m in masks[1:]:
-                    merged = np.maximum(merged, m)
+                for m in masks[1:]: merged = np.maximum(merged, m)
             elif mode == "max":
                 merged = np.maximum.reduce(masks)
             else:
                 merged = np.mean(masks, axis=0)
 
-            # ---- post-process ----
+            # ---- sensitivity threshold ----
             thresh = np.clip(sensitivity, 0.01, 0.99)
             merged = np.clip((merged - (thresh - 0.5)) / (1.0 - thresh + 1e-6), 0.0, 1.0)
 
-            merged = remove_small_holes(merged)
-            merged = remove_small_islands(merged)
+            # ---- guided filter refinement (hair_mode) ----
+            # Applied BEFORE binary morphology to preserve soft hair edges.
+            # Resizes guide image to merge_res for pixel-aligned refinement.
+            if hair_mode:
+                guide_np = np.array(
+                    pil_img.resize((merge_res, merge_res), Image.LANCZOS)
+                ).astype(np.float32) / 255.0
+                merged = guided_filter_mask(merged, guide_np, radius=6, eps=5e-4)
+
+            # ---- morphological post-process ----
+            merged = remove_small_holes(merged, min_size=500)
+            # island removal: skip in hair_mode (strands look like small islands)
+            if not hair_mode:
+                merged = remove_small_islands(merged, min_size=300)
 
             if mask_offset != 0:
                 merged = erode_expand_mask(merged, mask_offset)
+            if feather_edges > 0:
+                merged = feather_mask(merged, feather_edges)
             if mask_blur > 0:
                 merged = smooth_mask(merged, mask_blur)
 
-            # resize merged mask back to original image dimensions
+            # ---- resize mask back to original dimensions ----
             mask_final = Image.fromarray(
                 (merged * 255).clip(0, 255).astype(np.uint8), mode="L"
             )
             mask_final = mask_final.resize((orig_w, orig_h), Image.LANCZOS)
 
             if refine_foreground:
-                pil_img = refine_foreground_colors(pil_img, mask_final)
+                pil_img = refine_foreground_colors(pil_img, mask_final, strength=0.65)
 
             out_img = apply_background(pil_img, mask_final, background)
 
