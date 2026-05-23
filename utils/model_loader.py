@@ -260,20 +260,23 @@ class _InSPyReNetWrapper:
 # The HuggingFace repo apple/DepthPro is WEIGHTS-ONLY (depth_pro.pt + README).
 # Python source lives at https://github.com/apple/ml-depth-pro
 #
+# depth_pro/__init__.py exports ONLY:
+#   create_model_and_transforms, load_rgb
+# DepthProConfig lives in depth_pro/depth_pro.py (the submodule).
+#
 # Loading strategies:
 #   1. depth_pro already installed as pip package
 #   2. transformers AutoModelForDepthEstimation (falls back gracefully)
 #   3a. Download source ZIP from GitHub → extract to .cache/depth_pro_src/
 #   3b. Patch optional dependencies (pillow_heif etc.) in extracted source
 #   3c. Download weights via hf_hub_download
-#   3d. Load via importlib from extracted source
+#   3d. Load package + submodule via importlib, pass ckpt_path to config
 # ==========================================================================
 
 _DEPTH_PRO_GITHUB_ZIP = (
     "https://github.com/apple/ml-depth-pro/archive/refs/heads/main.zip"
 )
 
-# Stub code injected at the top of utils.py to silence optional imports
 _PILLOW_HEIF_STUB = '''
 # --- nkVasi patch: make pillow_heif optional ---
 try:
@@ -289,23 +292,13 @@ except ImportError:
 
 
 def _patch_depth_pro_src(src_parent: str) -> None:
-    """
-    Patch depth_pro/utils.py in the extracted source so that
-    `import pillow_heif` does not crash when the package is absent.
-    The patch is idempotent — safe to call on every startup.
-    """
     utils_path = os.path.join(src_parent, "depth_pro", "utils.py")
     if not os.path.exists(utils_path):
-        return  # nothing to patch
-
+        return
     with open(utils_path, "r", encoding="utf-8") as fh:
         src = fh.read()
-
-    # Already patched?
     if "nkVasi patch" in src:
         return
-
-    # Replace bare `import pillow_heif` with our stub
     if "import pillow_heif" in src:
         patched = src.replace("import pillow_heif", _PILLOW_HEIF_STUB, 1)
         with open(utils_path, "w", encoding="utf-8") as fh:
@@ -313,12 +306,6 @@ def _patch_depth_pro_src(src_parent: str) -> None:
 
 
 def _ensure_depth_pro_src() -> str:
-    """
-    Ensure the Depth Pro Python source is present in _DEPTH_PRO_SRC_CACHE.
-    Downloads and extracts from GitHub if not already present.
-    Always applies compatibility patches before returning.
-    Returns the path that should be added to sys.path (contains depth_pro/).
-    """
     src_parent = os.path.join(_DEPTH_PRO_SRC_CACHE, "ml-depth-pro-main", "src")
     marker     = os.path.join(src_parent, "depth_pro", "__init__.py")
 
@@ -332,14 +319,12 @@ def _ensure_depth_pro_src() -> str:
 
         print(f"  {c['dim']}Downloading Depth Pro source from GitHub…{c['reset']}")
         print(f"  {c['dim']}URL: {_DEPTH_PRO_GITHUB_ZIP}{c['reset']}")
-
         try:
             urllib.request.urlretrieve(_DEPTH_PRO_GITHUB_ZIP, zip_path)
         except Exception as e:
             raise RuntimeError(
                 f"[nkVasi] Failed to download Depth Pro source ZIP: {e}\n"
-                f"Please install manually: "
-                f"pip install git+https://github.com/apple/ml-depth-pro"
+                f"Please install manually: pip install git+https://github.com/apple/ml-depth-pro"
             ) from e
 
         print(f"  {c['dim']}Extracting…{c['reset']}")
@@ -347,7 +332,6 @@ def _ensure_depth_pro_src() -> str:
             zf.extractall(_DEPTH_PRO_SRC_CACHE)
         os.remove(zip_path)
 
-        # Fallback: search if archive structure differs
         if not os.path.exists(marker):
             for dp, dn, _ in os.walk(_DEPTH_PRO_SRC_CACHE):
                 if "depth_pro" in dn:
@@ -361,21 +345,25 @@ def _ensure_depth_pro_src() -> str:
                     f"Cache dir: {_DEPTH_PRO_SRC_CACHE}"
                 )
 
-    # Always patch on every call (idempotent) — handles case where
-    # source was extracted by a previous version before patching existed.
     _patch_depth_pro_src(src_parent)
     return src_parent
 
 
 def _importlib_load_depth_pro(src_parent: str):
-    """Load depth_pro via importlib, purging any stale sys.modules entries first."""
+    """
+    Load the depth_pro package from src_parent via importlib.
+    Also explicitly loads the depth_pro.depth_pro submodule so that
+    DepthProConfig and create_model_and_transforms are fully available.
+    Returns the top-level depth_pro module.
+    """
     import importlib.util
 
+    # Purge any stale entries
     for key in list(sys.modules.keys()):
         if key == "depth_pro" or key.startswith("depth_pro."):
             del sys.modules[key]
 
-    # Also pre-register stub for pillow_heif to be safe
+    # Pre-register pillow_heif stub so submodules that import it don't crash
     if "pillow_heif" not in sys.modules:
         try:
             import pillow_heif  # noqa: F401
@@ -385,15 +373,36 @@ def _importlib_load_depth_pro(src_parent: str):
             stub.register_heif_opener = lambda *a, **kw: None  # type: ignore
             sys.modules["pillow_heif"] = stub
 
-    init_path = os.path.join(src_parent, "depth_pro", "__init__.py")
-    spec = importlib.util.spec_from_file_location(
-        "depth_pro", init_path,
-        submodule_search_locations=[os.path.join(src_parent, "depth_pro")],
+    dp_dir = os.path.join(src_parent, "depth_pro")
+
+    def _load_submodule(name: str, rel_path: str):
+        path = os.path.join(dp_dir, rel_path)
+        spec = importlib.util.spec_from_file_location(
+            name, path,
+            submodule_search_locations=[dp_dir],
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    # 1. Load package root (__init__.py)
+    init_spec = importlib.util.spec_from_file_location(
+        "depth_pro",
+        os.path.join(dp_dir, "__init__.py"),
+        submodule_search_locations=[dp_dir],
     )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["depth_pro"] = module
-    spec.loader.exec_module(module)
-    return module
+    pkg = importlib.util.module_from_spec(init_spec)
+    sys.modules["depth_pro"] = pkg
+    init_spec.loader.exec_module(pkg)
+
+    # 2. Explicitly load depth_pro.depth_pro submodule (contains DepthProConfig)
+    #    This is needed because __init__.py only re-exports create_model_and_transforms
+    #    but DepthProConfig is defined in the submodule itself.
+    dp_sub = _load_submodule("depth_pro.depth_pro", "depth_pro.py")
+    pkg.depth_pro = dp_sub  # attach as attribute for convenience
+
+    return pkg
 
 
 class _DepthProWrapper:
@@ -408,8 +417,8 @@ class _DepthProWrapper:
         try:
             print(f"  {c['dim']}Strategy 1/3 · depth_pro pip package{c['reset']}")
             with _SpinnerCtx("DepthPro · pip package         "):
-                import depth_pro
-                self._model, self._transform = depth_pro.create_model_and_transforms()
+                import depth_pro as _dp
+                self._model, self._transform = _dp.create_model_and_transforms()
                 self._model.eval()
                 if torch.cuda.is_available():
                     self._model = self._model.cuda()
@@ -439,10 +448,9 @@ class _DepthProWrapper:
         # ---- Strategy 3: GitHub source ZIP + HF weights ----
         print(f"  {c['dim']}Strategy 3/3 · GitHub source ZIP + HF weights{c['reset']}")
 
-        # 3a/3b — Source (with patches) + weights
         try:
             with _SpinnerCtx("DepthPro · source from GitHub  "):
-                src_parent = _ensure_depth_pro_src()  # patches applied inside
+                src_parent = _ensure_depth_pro_src()
         except Exception as e:
             raise RuntimeError(str(e)) from e
 
@@ -462,13 +470,17 @@ class _DepthProWrapper:
 
         print(f"  {c['dim']}Weights: {ckpt_path}{c['reset']}")
 
-        # 3c — Load via importlib (pillow_heif stub already in sys.modules)
+        # 3d — Load via importlib.
+        # DepthProConfig lives in depth_pro.depth_pro submodule, not in package root.
+        # create_model_and_transforms accepts a config kwarg with checkpoint_uri.
         try:
             with _SpinnerCtx("DepthPro · dynamic import      "):
-                depth_pro = _importlib_load_depth_pro(src_parent)
-                cfg = depth_pro.DepthProConfig(checkpoint_uri=ckpt_path)
+                dp_pkg = _importlib_load_depth_pro(src_parent)
+                # DepthProConfig is in the submodule, attached as pkg.depth_pro
+                DepthProConfig = dp_pkg.depth_pro.DepthProConfig
+                cfg = DepthProConfig(checkpoint_uri=ckpt_path)
                 self._model, self._transform = \
-                    depth_pro.create_model_and_transforms(config=cfg)
+                    dp_pkg.create_model_and_transforms(config=cfg)
                 self._model.eval()
                 if torch.cuda.is_available():
                     self._model = self._model.cuda()
@@ -509,7 +521,6 @@ class _DepthProWrapper:
             return np.zeros_like(depth)
         norm = (depth - d_min) / (d_max - d_min)
 
-        # Auto-detect inverted depth and fix (FG centre should be low=near)
         h, w   = norm.shape
         cy, cx = h // 2, w // 2
         centre_val = float(norm[cy - h // 8:cy + h // 8, cx - w // 8:cx + w // 8].mean())
