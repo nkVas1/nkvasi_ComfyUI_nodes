@@ -1,5 +1,15 @@
 """
-NkVasi_RMBG_Ensemble — multi-model ensemble for maximum precision.
+NkVasi_RMBG_Ensemble v2.0 — multi-model ensemble for maximum precision.
+
+New in v2.0:
+  - Confidence Map output: per-pixel agreement between models exported as MASK.
+    High value (white) = models agree = safe zone.
+    Low value (black)  = models disagree = edge / uncertain zone.
+    Connect this output to MattingRefine's `confidence` input to restrict
+    the matting engine to ONLY the uncertain zone — faster and more accurate.
+  - Adaptive Trimap mode: automatically widens the unknown band in uncertain
+    and high-curvature regions, narrows it in confident flat-BG areas.
+    Enabled by default; can be turned off with adaptive_trimap=False.
 
 Merge modes:
   weighted_avg      — smooth weighted average
@@ -7,19 +17,6 @@ Merge modes:
   soft_intersection — geometric mean; penalises uncertain pixels
   intersection      — min across all models (strictest)
   union             — max across all models (most inclusive)
-
-Post-processing pipeline:
-  1. Merge
-  2. Sensitivity soft-remap
-  3. Guided filter
-  4. adaptive_bg_cleanup (hair_mode) or soft_remove_islands (standard)
-  5. soft_remove_islands for FG artefacts (always)
-  6. soft_remove_holes
-  7. Geometric ops
-  8. Resize to original
-  9. Foreground decontamination (alpha mode only)
-
-For maximum quality, chain with NkVasi_MattingRefine afterward.
 """
 import torch
 import numpy as np
@@ -35,6 +32,10 @@ from ..utils.mask_ops import (
     smooth_mask, erode_expand_mask, guided_filter_mask,
     soft_remove_holes, soft_remove_islands,
     adaptive_bg_cleanup, feather_mask,
+)
+from ..utils.confidence import (
+    confidence_weighted_merge, build_confidence_map,
+    build_adaptive_trimap, confidence_to_pil,
 )
 
 MERGE_MODES = [
@@ -85,11 +86,16 @@ def _merge_masks(masks: list, weights: list, mode: str) -> np.ndarray:
 
 
 class NkVasi_RMBG_Ensemble:
-    """Multi-model ensemble BG removal. Chain with MattingRefine for best results."""
+    """
+    v2.0: Multi-model ensemble BG removal with Confidence Map output
+    and Adaptive Trimap.
+    Chain with MattingRefine for best results — pass confidence_map output
+    into MattingRefine's confidence input to focus matting only where needed.
+    """
 
     CATEGORY = "🎭 nkVasi/Background Removal"
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("image", "mask")
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK")
+    RETURN_NAMES = ("image", "mask", "confidence_map")
     FUNCTION = "remove_background_ensemble"
 
     @classmethod
@@ -104,7 +110,6 @@ class NkVasi_RMBG_Ensemble:
                 "merge_mode":         (MERGE_MODES, {"default": "consensus (recommended)"}),
                 "process_resolution": ("INT", {"default": 2048, "min": 512, "max": 2048, "step": 128}),
                 "background":         (BACKGROUNDS, {"default": "alpha"}),
-                # hair_mode: contrast-aware BG cleanup (ON for portraits)
                 "hair_mode":          ("BOOLEAN", {"default": True}),
             },
             "optional": {
@@ -112,14 +117,21 @@ class NkVasi_RMBG_Ensemble:
                 "birefnet_matting_weight": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "ben2_weight":             ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "rmbg2_weight":            ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "mask_blur":         ("INT",   {"default": 1,    "min": 0,    "max": 32,   "step": 1}),
-                "mask_offset":       ("INT",   {"default": 0,    "min": -20,  "max": 20,   "step": 1}),
-                "feather_edges":     ("INT",   {"default": 2,    "min": 0,    "max": 32,   "step": 1}),
-                "sensitivity":       ("FLOAT", {"default": 0.45, "min": 0.0,  "max": 1.0,  "step": 0.01}),
-                "bg_cleanup_thresh": ("FLOAT", {"default": 0.10, "min": 0.0,  "max": 0.5,  "step": 0.01}),
-                "artefact_size":     ("INT",   {"default": 600,  "min": 0,    "max": 10000, "step": 50}),
+                "mask_blur":         ("INT",   {"default": 1,    "min": 0,   "max": 32,   "step": 1}),
+                "mask_offset":       ("INT",   {"default": 0,    "min": -20, "max": 20,   "step": 1}),
+                "feather_edges":     ("INT",   {"default": 2,    "min": 0,   "max": 32,   "step": 1}),
+                "sensitivity":       ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0,  "step": 0.01}),
+                "bg_cleanup_thresh": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 0.5,  "step": 0.01}),
+                "artefact_size":     ("INT",   {"default": 600,  "min": 0,   "max": 10000, "step": 50}),
                 "refine_foreground": ("BOOLEAN", {"default": True}),
                 "fp16":              ("BOOLEAN", {"default": True}),
+                # --- Adaptive trimap ---
+                "adaptive_trimap":   ("BOOLEAN", {"default": True,
+                                                   "tooltip": "Widen unknown band near uncertain/complex edges, narrow it elsewhere"}),
+                "trimap_min_px":     ("INT",     {"default": 4,  "min": 2,  "max": 20, "step": 1,
+                                                   "tooltip": "Min unknown-band half-width (confident flat areas)"}),
+                "trimap_max_px":     ("INT",     {"default": 24, "min": 6,  "max": 60, "step": 2,
+                                                   "tooltip": "Max unknown-band half-width (hair / uncertain edges)"}),
             },
         }
 
@@ -146,10 +158,14 @@ class NkVasi_RMBG_Ensemble:
         artefact_size=600,
         refine_foreground=True,
         fp16=True,
+        adaptive_trimap=True,
+        trimap_min_px=4,
+        trimap_max_px=24,
     ):
-        results_img  = []
-        results_mask = []
-        merge_res    = process_resolution
+        results_img   = []
+        results_mask  = []
+        results_conf  = []
+        merge_res     = process_resolution
 
         for i in range(image.shape[0]):
             pil_img        = tensor_to_pil(image[i])
@@ -183,14 +199,24 @@ class NkVasi_RMBG_Ensemble:
             if not masks:
                 raise ValueError("[nkVasi] At least one model must be enabled.")
 
-            merged = _merge_masks(masks, weights, merge_mode)
+            # ---- Merge + Confidence Map ----
+            merged, confidence = confidence_weighted_merge(masks, weights)
 
+            # Override merged with consensus/intersection/union if requested
+            # (confidence_weighted_merge always uses weighted_avg for the merged output;
+            #  re-merge with the requested mode if different)
+            if not merge_mode.startswith("weighted_avg"):
+                merged = _merge_masks(masks, weights, merge_mode)
+
+            # ---- Sensitivity remap ----
             thresh = np.clip(sensitivity, 0.01, 0.99)
             merged = np.clip(
                 (merged - (thresh - 0.5)) / (1.0 - thresh + 0.15), 0.0, 1.0)
 
+            # ---- Guided filter (anti-alias corrected float guide) ----
             merged = guided_filter_mask(merged, guide_np, radius=7, eps=3e-4)
 
+            # ---- BG cleanup ----
             if hair_mode:
                 merged = adaptive_bg_cleanup(
                     merged, guide_np,
@@ -203,6 +229,27 @@ class NkVasi_RMBG_Ensemble:
 
             merged = soft_remove_holes(merged, min_hole_size=600)
 
+            # ---- Adaptive Trimap baked into confidence output ----
+            # We expose the adaptive trimap as part of confidence_map so that
+            # MattingRefine can consume it without extra nodes.
+            # The actual trimap is built here for reference / downstream use;
+            # MattingRefine uses the confidence mask directly to adapt its own
+            # trimap_band_px per-pixel.
+            if adaptive_trimap:
+                _trimap = build_adaptive_trimap(
+                    merged, confidence,
+                    min_band_px=trimap_min_px,
+                    max_band_px=trimap_max_px,
+                )
+                # Encode trimap into confidence_map output:
+                # unknown zone (128) → 0.5, FG (255) → 1.0, BG (0) → 0.0
+                # This makes the output directly usable as a visual debug mask
+                # AND as a signal for MattingRefine.
+                conf_out = _trimap.astype(np.float32) / 255.0
+            else:
+                conf_out = confidence
+
+            # ---- Geometric ops ----
             if mask_offset != 0:
                 merged = erode_expand_mask(merged, mask_offset)
             if feather_edges > 0:
@@ -210,9 +257,13 @@ class NkVasi_RMBG_Ensemble:
             if mask_blur > 0:
                 merged = smooth_mask(merged, mask_blur)
 
+            # ---- Resize outputs to original resolution ----
             mask_final_pil = Image.fromarray(
                 (merged * 255).clip(0, 255).astype(np.uint8), mode="L"
             ).resize((orig_w, orig_h), Image.LANCZOS)
+
+            conf_final_pil = confidence_to_pil(conf_out).resize(
+                (orig_w, orig_h), Image.LANCZOS)
 
             if refine_foreground and background == "alpha":
                 pil_img = refine_foreground_colors(pil_img, mask_final_pil, strength=0.60)
@@ -221,5 +272,10 @@ class NkVasi_RMBG_Ensemble:
 
             results_img.append(pil_to_tensor(out_img))
             results_mask.append(pil_mask_to_tensor(mask_final_pil))
+            results_conf.append(pil_mask_to_tensor(conf_final_pil))
 
-        return (torch.stack(results_img), torch.stack(results_mask))
+        return (
+            torch.stack(results_img),
+            torch.stack(results_mask),
+            torch.stack(results_conf),
+        )
