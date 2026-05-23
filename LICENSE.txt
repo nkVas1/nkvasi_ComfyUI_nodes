@@ -1,10 +1,116 @@
-Copyright (c) 2026 Nikita Vasiliuk (github.com/nkVasi). All rights reserved.
+Copyright (c) 2026 Nikita Vasiliuk (github.com/nkVasi)
+All rights reserved under the terms described below.
 
-This source code and all associated files are the proprietary and confidential
-property of Nikita Vasiliuk. The software is provided for internal use only.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PROPRIETARY SOURCE-AVAILABLE LICENSE
+Non-Commercial · Attribution · ShareAlike
+Version 1.0, May 2026
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Unauthorized copying, reproduction, modification, distribution, sublicensing,
-or any other use of this software, in whole or in part, via any medium, is
-strictly prohibited without the express prior written permission of the author.
+This software and all associated files are the proprietary and
+confidential property of Nikita Vasiliuk ("Author"). By accessing,
+copying, modifying, or distributing this software, you agree to be
+bound by the terms of this License.
 
-For licensing inquiries, contact the author via GitHub: https://github.com/nkVasi
+────────────────────────────────────────────────────
+1. GRANT OF LICENSE
+────────────────────────────────────────────────────
+
+Subject to the terms and conditions of this License, the Author
+hereby grants you a worldwide, royalty-free, non-exclusive,
+non-sublicensable license to:
+
+  a) Access and study the source code for personal and educational
+     purposes;
+
+  b) Copy and redistribute the software in any medium or format,
+     provided that attribution to the original Author is preserved
+     and this License is included in full;
+
+  c) Modify, remix, transform, or build upon the software,
+     provided that any derivative work is distributed solely under
+     this same License or a substantially equivalent license that
+     preserves all Non-Commercial and ShareAlike conditions
+     ("Adapted Material").
+
+────────────────────────────────────────────────────
+2. CONDITIONS
+────────────────────────────────────────────────────
+
+2.1 ATTRIBUTION
+    All copies or substantial portions of this software, including
+    derivative works, must include a clear and prominent notice:
+
+      "Based on work by Nikita Vasiliuk (github.com/nkVasi).
+       Licensed under the nkVasi Proprietary NC-SA License v1.0."
+
+    You may not imply that the Author endorses you or your work.
+
+2.2 NON-COMMERCIAL USE ONLY
+    You may not use this software, in whole or in part, for any
+    Commercial Purpose without the express prior written permission
+    of the Author.
+
+    "Commercial Purpose" means any use primarily intended for or
+    directed towards commercial advantage or monetary compensation,
+    including but not limited to:
+      — incorporating into a paid product or SaaS offering;
+      — using as part of a service for which payment is received;
+      — using by or on behalf of a for-profit organization for
+        internal business operations that generate revenue.
+
+2.3 SHAREALIKE
+    If you distribute Adapted Material (modified versions of this
+    software), you must release such material under this same
+    License, in full, without additional restrictions. You may not
+    apply legal terms or technical measures that restrict others
+    from exercising the rights granted herein.
+
+    Forks and derivative repositories published publicly on any
+    platform (including GitHub) must link to the original
+    repository and include this License file unmodified.
+
+────────────────────────────────────────────────────
+3. RESERVATION OF COMMERCIAL RIGHTS
+────────────────────────────────────────────────────
+
+The Author expressly reserves the exclusive right to commercialize
+this software and any derivative works based upon it. The Author
+may, at their sole discretion, issue separate Commercial License
+agreements to third parties.
+
+For commercial licensing inquiries, contact the Author via GitHub:
+https://github.com/nkVasi
+
+────────────────────────────────────────────────────
+4. NO WARRANTY
+────────────────────────────────────────────────────
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF,
+OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+
+────────────────────────────────────────────────────
+5. TERMINATION
+────────────────────────────────────────────────────
+
+This License and the rights granted hereunder will terminate
+automatically upon any breach of its terms by you. Upon
+termination, you must destroy all copies of the software in
+your possession. Sections 3, 4, and 5 survive termination.
+
+────────────────────────────────────────────────────
+6. GOVERNING LAW
+────────────────────────────────────────────────────
+
+This License shall be governed by and construed in accordance
+with applicable international copyright law. Any disputes shall
+be resolved by the Author's jurisdiction of choice.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+END OF LICENSE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
