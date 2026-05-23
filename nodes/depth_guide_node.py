@@ -1,34 +1,26 @@
 """
-NkVasi_DepthGuide v1.0
+NkVasi_DepthGuide v2.0
 
 Depth Pro — guided mask refinement node.
 
 This node sits between RMBG_Ensemble and MattingRefine in the workflow:
 
-  IMAGE ─┬─> RMBG_Ensemble ──> mask ───────────────────> DepthGuide ─> mask_refined ─> MattingRefine
-         └─────────────────────────────────────────────> DepthGuide
-                                  confidence_map ──────────> DepthGuide (optional)
+  IMAGE ─┬─> RMBG_Ensemble ──> mask ──────────────────> DepthGuide ─> mask_refined ─> MattingRefine
+         └────────────────────────────────────────────> DepthGuide
+                                  confidence_map ─────────> DepthGuide (optional)
 
-What it does
-------------
+What it does (v2)
+-----------------
 1. Runs Depth Pro on the input image — produces metric depth map.
-2. Normalises depth: 0=nearest (FG), 1=farthest (BG).
-3. Refines the mask:
-   a. BG suppression: edge pixels whose depth > fg_depth_percentile-th
-      percentile of the FG zone → pushed toward alpha=0.
-   b. FG boost: near pixels in edge zone → nudged toward alpha=1.
-   c. Adaptive trimap: depth gradient used as boundary-complexity signal
-      to vary the unknown-band width per pixel.
-4. Outputs refined mask + depth map (visualised as MASK for debugging).
-
-This is especially effective for:
-  - Blue sky / uniform colour BG where bg_color_suppress already helps
-    but depth adds a second independent signal.
-  - Scenes where subject and BG have similar colour (same-colour fringe).
-  - Any image where FG and BG are clearly at different distances.
-
-NOTE: Depth Pro requires the `depth-pro` pip package OR the apple/DepthPro
-HuggingFace model. It is auto-loaded on first use and cached.
+2. Polarity resolved via mask oracle (not centre/border heuristic).
+3. Four-pass refinement:
+   Pass 1  BG veto      — far-depth edge pixels suppressed
+   Pass 2  FG recovery  — near-depth pixels missed by ensemble recovered
+   Pass 3  Edge crisp   — depth-edge driven alpha sharpening at boundary
+   Pass 4  Hard lock    — safe-zone pixels snapped to ensemble values
+4. Adaptive trimap: depth gradient + missed-strands expansion gives
+   MattingRefine the best possible working zone.
+5. Outputs refined mask + depth map (visualised as MASK for debugging).
 """
 import torch
 import numpy as np
@@ -44,7 +36,7 @@ from ..utils.image_utils    import tensor_to_pil, pil_mask_to_tensor
 
 class NkVasi_DepthGuide:
     """
-    v1.0: Depth Pro guided mask refinement.
+    v2.0: Depth Pro guided mask refinement.
     Insert between RMBG_Ensemble and MattingRefine for best results.
     """
 
@@ -66,7 +58,7 @@ class NkVasi_DepthGuide:
                     "tooltip": "confidence_map from RMBG_Ensemble — combined with depth for better trimap"
                 }),
 
-                # --- Depth-guided BG suppression ---
+                # --- Pass 1: BG suppression ---
                 "bg_suppress_strength": ("FLOAT", {
                     "default": 0.70, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "How aggressively to push far-depth edge pixels toward BG"
@@ -76,12 +68,24 @@ class NkVasi_DepthGuide:
                     "tooltip": "Percentile of FG depth used as BG threshold. Higher = more conservative"
                 }),
                 "depth_bg_threshold": ("FLOAT", {
-                    "default": 0.85, "min": 0.50, "max": 1.00, "step": 0.01,
+                    "default": 0.75, "min": 0.50, "max": 1.00, "step": 0.01,
                     "tooltip": "Normalised depth above which a pixel is considered definitely BG"
                 }),
+
+                # --- Pass 2: FG recovery ---
                 "depth_fg_threshold": ("FLOAT", {
-                    "default": 0.30, "min": 0.05, "max": 0.60, "step": 0.01,
-                    "tooltip": "Normalised depth below which a pixel is considered definitely FG"
+                    "default": 0.35, "min": 0.05, "max": 0.60, "step": 0.01,
+                    "tooltip": "Depth below which missed strands are eligible for FG recovery"
+                }),
+                "recovery_max": ("FLOAT", {
+                    "default": 0.60, "min": 0.10, "max": 1.00, "step": 0.05,
+                    "tooltip": "Maximum alpha to restore when recovering a missed FG strand"
+                }),
+
+                # --- Pass 3: Edge crisp ---
+                "edge_crisp_strength": ("FLOAT", {
+                    "default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "How much to sharpen the alpha boundary using depth edges"
                 }),
 
                 # --- Adaptive trimap from depth ---
@@ -113,8 +117,10 @@ class NkVasi_DepthGuide:
         confidence=None,
         bg_suppress_strength=0.70,
         fg_depth_percentile=80.0,
-        depth_bg_threshold=0.85,
-        depth_fg_threshold=0.30,
+        depth_bg_threshold=0.75,
+        depth_fg_threshold=0.35,
+        recovery_max=0.60,
+        edge_crisp_strength=0.50,
         use_depth_trimap=True,
         trimap_min_px=4,
         trimap_max_px=24,
@@ -152,13 +158,15 @@ class NkVasi_DepthGuide:
                         c_pil.resize((m_np.shape[1], m_np.shape[0]), Image.LANCZOS)
                     ).astype(np.float32) / 255.0
 
-            # ---- 3. Depth-guided mask refinement ----
+            # ---- 3. Depth-guided mask refinement (v2 four-pass) ----
             m_refined = depth_guided_mask(
                 m_np, depth_norm,
                 strength=bg_suppress_strength,
                 fg_percentile=fg_depth_percentile,
                 depth_bg_suppress=depth_bg_threshold,
-                depth_fg_boost=depth_fg_threshold,
+                depth_fg_recover=depth_fg_threshold,   # v2: was depth_fg_boost
+                recovery_max=recovery_max,
+                edge_crisp_strength=edge_crisp_strength,
             )
 
             # ---- 4. Adaptive trimap baked into refined mask ----
