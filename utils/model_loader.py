@@ -256,10 +256,60 @@ class _InSPyReNetWrapper:
 # Depth Pro wrapper  (Apple MLRC, 2024)
 #
 # Loading strategies (tried in order):
-#   1. depth_pro pip package   (pip install depth-pro)
+#   1. depth_pro pip package   (pip install git+https://github.com/apple/ml-depth-pro)
 #   2. HuggingFace transformers AutoModelForDepthEstimation  (apple/DepthPro)
-#   3. snapshot_download + dynamic import of depth_pro source
+#   3. snapshot_download + robust src/ discovery + importlib.util load
 # ==========================================================================
+
+def _find_depth_pro_src(root: str) -> str | None:
+    """
+    Recursively search `root` for a directory containing depth_pro/__init__.py.
+    Returns the parent directory (the one to add to sys.path), or None.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        if "depth_pro" in dirnames:
+            candidate = os.path.join(dirpath, "depth_pro", "__init__.py")
+            if os.path.exists(candidate):
+                return dirpath  # add dirpath so `import depth_pro` works
+    return None
+
+
+def _find_checkpoint(root: str) -> str | None:
+    """
+    Search for the Depth Pro checkpoint file inside `root`.
+    Apple repo uses 'depth_pro.pt'; HF LFS may store it under blobs/.
+    """
+    for name in ("depth_pro.pt", "pytorch_model.bin", "model.safetensors"):
+        for dirpath, _, filenames in os.walk(root):
+            if name in filenames:
+                return os.path.join(dirpath, name)
+    return None
+
+
+def _importlib_load_depth_pro(src_parent: str):
+    """
+    Load depth_pro as a module via importlib so we don't depend on sys.path
+    being clean, and avoid conflicts with a previously-cached failed import.
+    """
+    import importlib
+    import importlib.util
+
+    # Remove any stale cached entry (e.g. from a failed bare import attempt)
+    for key in list(sys.modules.keys()):
+        if key == "depth_pro" or key.startswith("depth_pro."):
+            del sys.modules[key]
+
+    init_path = os.path.join(src_parent, "depth_pro", "__init__.py")
+    spec   = importlib.util.spec_from_file_location(
+        "depth_pro", init_path,
+        submodule_search_locations=[os.path.join(src_parent, "depth_pro")],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["depth_pro"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class _DepthProWrapper:
     HF_ID = "apple/DepthPro"
 
@@ -289,7 +339,8 @@ class _DepthProWrapper:
                 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
                 self._processor = AutoImageProcessor.from_pretrained(self.HF_ID)
                 self._model     = AutoModelForDepthEstimation.from_pretrained(
-                    self.HF_ID, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                    self.HF_ID,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 )
                 self._model.eval()
                 if torch.cuda.is_available():
@@ -299,8 +350,8 @@ class _DepthProWrapper:
         except Exception as e:
             print(f"  {c['dim']}transformers strategy failed ({e}), trying Strategy 3…{c['reset']}")
 
-        # ---- Strategy 3: snapshot_download + dynamic import ----
-        print(f"  {c['dim']}Strategy 3/3 · snapshot_download{c['reset']}")
+        # ---- Strategy 3: snapshot_download + robust dynamic import ----
+        print(f"  {c['dim']}Strategy 3/3 · snapshot_download + importlib{c['reset']}")
         try:
             from huggingface_hub import snapshot_download
             with _SpinnerCtx("DepthPro · snapshot_download   "):
@@ -308,18 +359,49 @@ class _DepthProWrapper:
         except Exception as e:
             raise RuntimeError(f"[nkVasi] Depth Pro download failed: {e}") from e
 
-        src_path = os.path.join(local_dir, "src")
-        if os.path.isdir(src_path):
-            sys.path.insert(0, src_path)
+        c2 = _SpinnerCtx.C
+        print(f"  {c2['dim']}Snapshot path: {local_dir}{c2['reset']}")
+
+        # --- Find src/depth_pro anywhere in the snapshot tree ---
+        src_parent = _find_depth_pro_src(local_dir)
+        if src_parent is None:
+            # Snapshot may not include Python source (weights-only repo).
+            # Try HF hub cache blobs structure one level up.
+            parent = os.path.dirname(local_dir)
+            src_parent = _find_depth_pro_src(parent)
+
+        if src_parent is None:
+            files_found = []
+            for dp, dn, fn in os.walk(local_dir):
+                for f in fn:
+                    files_found.append(os.path.relpath(os.path.join(dp, f), local_dir))
+            raise RuntimeError(
+                f"[nkVasi] Depth Pro: could not find depth_pro/__init__.py in snapshot.\n"
+                f"Files in snapshot:\n" + "\n".join(files_found[:40])
+            )
+
+        print(f"  {c2['dim']}Found depth_pro source at: {src_parent}{c2['reset']}")
+
+        # --- Find checkpoint ---
+        ckpt_path = _find_checkpoint(local_dir)
+        if ckpt_path is None:
+            ckpt_path = _find_checkpoint(os.path.dirname(local_dir))
+        print(f"  {c2['dim']}Checkpoint: {ckpt_path}{c2['reset']}")
 
         try:
             with _SpinnerCtx("DepthPro · dynamic import      "):
-                import depth_pro
-                self._model, self._transform = depth_pro.create_model_and_transforms(
-                    config=depth_pro.DepthProConfig(
-                        checkpoint_uri=os.path.join(local_dir, "depth_pro.pt")
-                    )
-                )
+                depth_pro = _importlib_load_depth_pro(src_parent)
+
+                if ckpt_path is not None:
+                    # Build config with explicit checkpoint path
+                    cfg = depth_pro.DepthProConfig(checkpoint_uri=ckpt_path)
+                    self._model, self._transform = \
+                        depth_pro.create_model_and_transforms(config=cfg)
+                else:
+                    # Let the library find the checkpoint itself
+                    self._model, self._transform = \
+                        depth_pro.create_model_and_transforms()
+
                 self._model.eval()
                 if torch.cuda.is_available():
                     self._model = self._model.cuda()
@@ -334,14 +416,11 @@ class _DepthProWrapper:
     def infer(self, pil_img: Image.Image) -> np.ndarray:
         """
         Run Depth Pro on a PIL image.
-        Returns float32 H×W depth in metres (metric) OR normalised [0,1]
-        depending on strategy.  Always normalised to [0,1] before return,
-        with 0=nearest, 1=farthest.
+        Returns float32 H×W normalised depth: 0=nearest (FG), 1=farthest (BG).
         """
         rgb = pil_img.convert("RGB")
 
         if self._strategy in ("pip", "snapshot"):
-            # Official depth_pro API
             device = next(self._model.parameters()).device
             inp    = self._transform(rgb).unsqueeze(0).to(device)
             result = self._model.infer(inp)
@@ -361,25 +440,23 @@ class _DepthProWrapper:
         else:
             raise RuntimeError("[nkVasi] DepthPro: no strategy loaded")
 
-        # Normalise: 0 = nearest, 1 = farthest
+        # Normalise to [0, 1]
         d_min, d_max = float(depth.min()), float(depth.max())
         if d_max - d_min < 1e-5:
             return np.zeros_like(depth)
         norm = (depth - d_min) / (d_max - d_min)
-        # Depth Pro returns inverse depth (closer = higher value) in some
-        # variants — detect and flip if so by checking if FG has higher values
-        # (we assume the image centre is typically FG)
-        h, w  = norm.shape
+
+        # Auto-detect and fix inverted depth (centre should be FG = low value)
+        h, w   = norm.shape
         cy, cx = h // 2, w // 2
-        centre_val  = float(norm[cy-h//8:cy+h//8, cx-w//8:cx+w//8].mean())
-        border_val  = float(np.concatenate([
-            norm[:h//8, :].ravel(),
-            norm[-h//8:, :].ravel(),
-            norm[:, :w//8].ravel(),
-            norm[:, -w//8:].ravel(),
+        centre_val = float(norm[cy - h // 8:cy + h // 8, cx - w // 8:cx + w // 8].mean())
+        border_val = float(np.concatenate([
+            norm[:h // 8, :].ravel(),
+            norm[-h // 8:, :].ravel(),
+            norm[:, :w // 8].ravel(),
+            norm[:, -w // 8:].ravel(),
         ]).mean())
         if centre_val > border_val:
-            # Centre is "far" — this is inverted depth; flip so near=0, far=1
             norm = 1.0 - norm
 
         return norm.astype(np.float32)
