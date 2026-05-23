@@ -1,26 +1,25 @@
 """
 NkVasi_RMBG_Ensemble — multi-model ensemble for maximum precision.
 
-Merge modes (corrected semantics):
-  weighted_avg    — smooth compromise between all models (default)
-  consensus       — keep pixels WHERE MOST MODELS AGREE it is FG.
-                    Much more effective at removing background leaks than
-                    weighted_avg, while being less destructive than intersection.
-  soft_intersection — penalises pixels where models disagree; harder cutoff
-                    than weighted_avg, softer than strict intersection.
-  intersection    — keep ONLY pixels ALL models agree are FG (strictest)
-  union           — keep ANY pixel at least ONE model says is FG (most inclusive)
+Merge modes:
+  weighted_avg          — smooth weighted average
+  consensus             — mean × √(fraction_models_agree); best all-around
+  soft_intersection     — geometric mean; penalises uncertain pixels
+  intersection          — min across all models (strictest)
+  union                 — max across all models (most inclusive)
 
 Post-processing pipeline:
-  1. Merge
-  2. Sensitivity soft-remap
-  3. Guided filter (edge-aware soft alpha)
+  1.  Merge
+  2.  Sensitivity soft-remap (no binarisation)
+  3.  Guided filter — edge-aware sub-pixel alpha from image gradients
   4a. hair_bg_island_removal (hair_mode) — colour-gated BG patch removal
-   b. soft_remove_islands (standard mode)
-  5. soft_remove_holes
-  6. Geometric ops (offset, feather, blur)
-  7. Resize to original
-  8. Foreground decontamination
+   b. soft_remove_islands (non-hair mode)
+  5.  soft_remove_islands for FG artefacts ALWAYS — removes stray blobs
+      outside the main subject regardless of hair_mode
+  6.  soft_remove_holes — fills small interior holes
+  7.  Geometric ops (offset, feather, blur)
+  8.  Resize to original dimensions
+  9.  Foreground decontamination (alpha mode only)
 """
 import torch
 import numpy as np
@@ -40,7 +39,7 @@ from ..utils.mask_ops import (
 
 MERGE_MODES = [
     "weighted_avg",
-    "consensus (recommended for clean edges)",
+    "consensus (recommended)",
     "soft_intersection",
     "intersection (strictest)",
     "union (most inclusive)",
@@ -55,19 +54,6 @@ def _mask_pil_to_np(mask_pil: Image.Image, target_size: int) -> np.ndarray:
 
 
 def _merge_masks(masks: list, weights: list, mode: str) -> np.ndarray:
-    """
-    Merge a list of float32 masks according to the chosen mode.
-
-    weighted_avg:       sum(m*w) / sum(w)
-    consensus:          mean(m) * fraction_of_models_that_agree(m > 0.5)
-                        — strongly penalises pixels where models disagree.
-                        Best for removing background leaks without destroying hair.
-    soft_intersection:  product(m)^(1/n) — geometric mean.
-                        Each uncertain model pulls the value down.
-    intersection:       min across all models
-    union:              max across all models
-    """
-    n = len(masks)
     key = mode.split(" ")[0].lower()
 
     if key == "weighted_avg":
@@ -77,12 +63,9 @@ def _merge_masks(masks: list, weights: list, mode: str) -> np.ndarray:
     if key == "consensus":
         avg   = np.mean(masks, axis=0)
         agree = np.mean([(m > 0.5).astype(np.float32) for m in masks], axis=0)
-        # agree=1.0 when all models agree it's FG, 0.0 when all say BG
-        # Scale: pixels where only half the models agree get cut to ~50% opacity
         return np.clip(avg * (agree ** 0.5), 0, 1)
 
     if key == "soft_intersection":
-        # Geometric mean: penalises low-confidence pixels in any model
         stacked = np.stack(masks, axis=0).clip(1e-6, 1.0)
         return np.exp(np.mean(np.log(stacked), axis=0)).clip(0, 1)
 
@@ -98,12 +81,11 @@ def _merge_masks(masks: list, weights: list, mode: str) -> np.ndarray:
             result = np.maximum(result, m)
         return result
 
-    # fallback
     return np.mean(masks, axis=0)
 
 
 class NkVasi_RMBG_Ensemble:
-    """Multi-model ensemble for near-perfect background removal with soft alpha."""
+    """Multi-model ensemble for near-perfect background removal."""
 
     CATEGORY = "🎭 nkVasi/Background Removal"
     RETURN_TYPES = ("IMAGE", "MASK")
@@ -119,30 +101,34 @@ class NkVasi_RMBG_Ensemble:
                 "use_birefnet_matting": ("BOOLEAN", {"default": True}),
                 "use_ben2":             ("BOOLEAN", {"default": True}),
                 "use_rmbg2":            ("BOOLEAN", {"default": False}),
-                "merge_mode": (MERGE_MODES, {"default": "consensus (recommended for clean edges)"}),
-                "process_resolution": ("INT", {"default": 1536, "min": 512, "max": 2048, "step": 128}),
-                "background": (BACKGROUNDS, {"default": "alpha"}),
-                # hair_mode: colour-gated BG island removal + guided filter
-                # Enable for portraits; disable for product shots / hard objects
-                "hair_mode": ("BOOLEAN", {"default": True}),
+                "merge_mode":         (MERGE_MODES, {"default": "consensus (recommended)"}),
+                # 2048 — maximum quality; use 1536 if VRAM is limited
+                "process_resolution": ("INT", {"default": 2048, "min": 512, "max": 2048, "step": 128}),
+                "background":         (BACKGROUNDS, {"default": "alpha"}),
+                # hair_mode: adds colour-gated BG island removal between hair strands
+                # ON  — portraits, hair, fur: preserves strand detail, removes BG patches
+                # OFF — products, hard objects: standard FG island removal
+                # In BOTH modes, stray floating FG artefacts are always removed.
+                "hair_mode":          ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "birefnet_hr_weight":      ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "birefnet_matting_weight": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "ben2_weight":             ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "rmbg2_weight":            ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "mask_blur":    ("INT",   {"default": 1,   "min": 0,   "max": 32, "step": 1}),
-                "mask_offset":  ("INT",   {"default": 0,   "min": -20, "max": 20, "step": 1}),
-                "feather_edges":("INT",   {"default": 2,   "min": 0,   "max": 32, "step": 1}),
-                # sensitivity: 0.5 = neutral.
-                # Lower (e.g. 0.35) = keep more, good for hair preservation.
-                # Higher (e.g. 0.65) = cut more, good for clean backgrounds.
-                "sensitivity":  ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.01}),
-                # island_size: max pixel area of BG blobs to remove in hair_mode
-                "island_size":  ("INT",   {"default": 2000, "min": 100, "max": 20000, "step": 100}),
-                # color_thresh: 0.0-1.0. BG islands with colour distance ABOVE this
-                # from surrounding FG are removed. Lower = more aggressive removal.
-                "color_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "mask_blur":    ("INT",   {"default": 1,    "min": 0,    "max": 32,    "step": 1}),
+                "mask_offset":  ("INT",   {"default": 0,    "min": -20,  "max": 20,    "step": 1}),
+                "feather_edges":("INT",   {"default": 2,    "min": 0,    "max": 32,    "step": 1}),
+                # sensitivity: lower = keep more (looser); higher = cut more (stricter)
+                "sensitivity":  ("FLOAT", {"default": 0.45, "min": 0.0,  "max": 1.0,  "step": 0.01}),
+                # hair_mode params — only active when hair_mode=True
+                # island_size: max BG patch area (px at process_resolution) to remove
+                "island_size":  ("INT",   {"default": 2000, "min": 100,  "max": 30000, "step": 100}),
+                # color_thresh: max colour distance to keep as real inter-strand gap
+                # lower = more aggressive BG removal; 0.10-0.20 is the sweet spot
+                "color_thresh": ("FLOAT", {"default": 0.13, "min": 0.0,  "max": 1.0,  "step": 0.01}),
+                # artefact_size: max area of stray FG blobs to remove (both modes)
+                "artefact_size":("INT",   {"default": 600,  "min": 0,    "max": 10000, "step": 50}),
                 "refine_foreground": ("BOOLEAN", {"default": True}),
                 "fp16":              ("BOOLEAN", {"default": True}),
             },
@@ -168,7 +154,8 @@ class NkVasi_RMBG_Ensemble:
         feather_edges=2,
         sensitivity=0.45,
         island_size=2000,
-        color_thresh=0.15,
+        color_thresh=0.13,
+        artefact_size=600,
         refine_foreground=True,
         fp16=True,
     ):
@@ -211,8 +198,7 @@ class NkVasi_RMBG_Ensemble:
             # === STEP 1: Merge ===
             merged = _merge_masks(masks, weights, merge_mode)
 
-            # === STEP 2: Sensitivity soft-remap ===
-            # Does NOT binarise — ambiguous pixels stay semi-transparent.
+            # === STEP 2: Sensitivity soft-remap (no binarisation) ===
             thresh = np.clip(sensitivity, 0.01, 0.99)
             merged = np.clip(
                 (merged - (thresh - 0.5)) / (1.0 - thresh + 0.15),
@@ -220,14 +206,12 @@ class NkVasi_RMBG_Ensemble:
             )
 
             # === STEP 3: Guided filter ===
-            # Edge-aware smoothing. Builds real sub-pixel soft alpha from
-            # image gradients. Run BEFORE any morphological cleanup.
             merged = guided_filter_mask(merged, guide_np, radius=7, eps=3e-4)
 
-            # === STEP 4: Island removal ===
+            # === STEP 4: BG island removal ===
             if hair_mode:
-                # Colour-gated: removes BG patches that differ from adjacent hair.
-                # detect_thresh=0.25 catches semi-opaque BG left by guided filter.
+                # Colour-gated removal of BG patches inside the hair region.
+                # detect_thresh=0.25 catches semi-opaque BG from guided filter.
                 merged = hair_bg_island_removal(
                     merged, guide_np,
                     max_island_size=island_size,
@@ -235,12 +219,22 @@ class NkVasi_RMBG_Ensemble:
                     detect_thresh=0.25,
                 )
             else:
+                # For hard objects: standard removal of small FG islands
                 merged = soft_remove_islands(merged, min_island_size=400)
 
-            # === STEP 5: Fill interior holes ===
+            # === STEP 5: Remove stray FG artefacts (ALWAYS, both modes) ===
+            # This is separate from BG island removal above.
+            # Removes floating FG blobs outside the main subject
+            # (e.g. detached hair tips, reflection artefacts).
+            # min_island_size uses artefact_size, which is deliberately smaller
+            # than the island_size used for BG patches, to avoid cutting hair.
+            if artefact_size > 0:
+                merged = soft_remove_islands(merged, min_island_size=artefact_size)
+
+            # === STEP 6: Fill small interior holes ===
             merged = soft_remove_holes(merged, min_hole_size=600)
 
-            # === STEP 6: Geometric ops ===
+            # === STEP 7: Geometric ops ===
             if mask_offset != 0:
                 merged = erode_expand_mask(merged, mask_offset)
             if feather_edges > 0:
@@ -248,13 +242,14 @@ class NkVasi_RMBG_Ensemble:
             if mask_blur > 0:
                 merged = smooth_mask(merged, mask_blur)
 
-            # === STEP 7: Resize to original ===
+            # === STEP 8: Resize to original ===
             mask_final_pil = Image.fromarray(
                 (merged * 255).clip(0, 255).astype(np.uint8), mode="L"
             ).resize((orig_w, orig_h), Image.LANCZOS)
 
-            # === STEP 8: Foreground decontamination ===
-            if refine_foreground:
+            # === STEP 9: Foreground decontamination (alpha only) ===
+            # Not needed for solid backgrounds — the composited colour covers any bleed.
+            if refine_foreground and background == "alpha":
                 pil_img = refine_foreground_colors(pil_img, mask_final_pil, strength=0.60)
 
             out_img = apply_background(pil_img, mask_final_pil, background)
