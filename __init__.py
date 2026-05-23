@@ -1,9 +1,34 @@
-from .nodes.rmbg_node import NkVasi_RMBG_Node
-from .nodes.rmbg_ensemble import NkVasi_RMBG_Ensemble
-from .nodes.mask_refine import NkVasi_MaskRefine
-from .nodes.mask_tools import NkVasi_MaskTools
+"""
+nkVasi ComfyUI Nodes — package entry point.
+
+Optional dependency pymatting is auto-installed at startup if absent.
+This never downgrades numpy or any other package — it uses --no-deps.
+"""
+from .utils.auto_install import ensure_optional_deps
+
+# Kick off background install before node imports so that by the time
+# the user runs a workflow pymatting is likely already available.
+def _refresh_pymatting():
+    """Called by auto_install after pymatting is installed."""
+    try:
+        import importlib
+        import sys
+        # Re-trigger the availability check in matting_refine
+        mr = sys.modules.get("nkvasi_ComfyUI_nodes.nodes.matting_refine")
+        if mr is not None:
+            importlib.reload(mr)
+    except Exception:
+        pass
+
+ensure_optional_deps(callback=_refresh_pymatting)
+
+
+from .nodes.rmbg_node      import NkVasi_RMBG_Node
+from .nodes.rmbg_ensemble  import NkVasi_RMBG_Ensemble
+from .nodes.mask_refine    import NkVasi_MaskRefine
+from .nodes.mask_tools     import NkVasi_MaskTools
 from .nodes.save_image_alpha import NkVasi_SaveImageAlpha
-from .nodes.alpha_preview import NkVasi_AlphaPreview
+from .nodes.alpha_preview  import NkVasi_AlphaPreview
 from .nodes.matting_refine import NkVasi_MattingRefine
 
 NODE_CLASS_MAPPINGS = {
