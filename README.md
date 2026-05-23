@@ -1,1 +1,1 @@
-# rembgs_ComfyUI_nodes
+# nkvasi_ComfyUI_nodes
