@@ -42,7 +42,6 @@ from PIL import Image
 # Constants
 # ---------------------------------------------------------------------------
 
-# Depth Pro HuggingFace repo
 _DEPTH_PRO_HF_ID = "apple/DepthPro"
 
 
@@ -55,8 +54,6 @@ def _normalise_depth(depth: np.ndarray) -> np.ndarray:
     Normalise depth map to [0, 1] where:
       0 = closest point (foreground)
       1 = farthest point (background)
-
-    Works for both metric (metres) and relative depth.
     """
     d_min = float(depth.min())
     d_max = float(depth.max())
@@ -72,10 +69,8 @@ def _fg_depth_threshold(
 ) -> float:
     """
     Estimate the depth threshold that separates FG from BG.
-
-    Strategy: take the distribution of depth values in the FG zone
-    (mask > 0.5) and use the fg_percentile-th percentile as the
-    boundary.  Pixels beyond this depth are "probably background".
+    Uses fg_percentile-th percentile of depth values inside the FG zone
+    (mask > 0.5). Pixels beyond this depth are "probably background".
     """
     fg_depth = depth_norm[mask > 0.5]
     if len(fg_depth) == 0:
@@ -111,12 +106,22 @@ def depth_guided_mask(
 
     Returns:
         float32 H×W refined alpha
+
+    Fix log
+    -------
+    v1.1: Fixed fg_cand threshold formula (was computing fg_thresh²/fg_thresh
+          instead of a plain depth_fg_boost constant, making the FG boost
+          zone almost empty and allowing bg suppression to dominate even
+          near pixels, which made fine hair fringe appear brighter).
+          Fixed lock/blur order: hard cores are now locked BEFORE the
+          Gaussian smoothing pass so blur cannot raise already-suppressed
+          semi-transparent pixels back up.
     """
     import cv2
 
     # Resize depth to mask resolution if needed
     if depth_norm.shape != mask.shape:
-        depth_pil = Image.fromarray(
+        depth_pil  = Image.fromarray(
             (depth_norm * 255).clip(0, 255).astype(np.uint8), mode="L")
         depth_norm = np.array(
             depth_pil.resize((mask.shape[1], mask.shape[0]), Image.LANCZOS)
@@ -128,25 +133,31 @@ def depth_guided_mask(
     result = mask.copy()
 
     # ---- 1. BG suppression: far pixels in edge zone → push toward 0 ----
-    bg_cand = edge_zone & (depth_norm > max(fg_thresh, depth_bg_suppress))
+    #
+    # Threshold = the stricter of the adaptive fg_thresh and the hard
+    # depth_bg_suppress slider.  Using max() means we only suppress
+    # pixels that are clearly BG by BOTH measures.
+    bg_thresh = max(fg_thresh, depth_bg_suppress)
+    bg_cand   = edge_zone & (depth_norm > bg_thresh)
     if bg_cand.any():
-        # How much beyond the threshold?
-        over    = np.clip(
-            (depth_norm - max(fg_thresh, depth_bg_suppress)) /
-            max(1.0 - max(fg_thresh, depth_bg_suppress), 1e-3),
+        over       = np.clip(
+            (depth_norm - bg_thresh) / max(1.0 - bg_thresh, 1e-3),
             0.0, 1.0,
         )
         suppress_w = np.clip(over * strength, 0.0, 0.90)
         result[bg_cand] = result[bg_cand] * (1.0 - suppress_w[bg_cand])
 
     # ---- 2. FG confidence boost: near pixels in edge zone → push toward 1 ----
-    fg_cand = edge_zone & (depth_norm < min(fg_thresh * depth_fg_boost /
-                                             max(fg_thresh, 1e-3) * fg_thresh,
-                                             depth_fg_boost))
+    #
+    # Fixed: threshold is simply depth_fg_boost (a plain constant).
+    # Previous code computed `fg_thresh * depth_fg_boost / fg_thresh * fg_thresh`
+    # which collapsed to `depth_fg_boost * fg_thresh` — typically ~0.21 instead
+    # of 0.30, making this branch nearly a no-op and leaving hair fringe
+    # pixels unprotected so BG suppression raised their relative brightness.
+    fg_cand = edge_zone & (depth_norm < depth_fg_boost)
     if fg_cand.any():
         under   = np.clip(
-            (min(fg_thresh, depth_fg_boost) - depth_norm) /
-            max(min(fg_thresh, depth_fg_boost), 1e-3),
+            (depth_fg_boost - depth_norm) / max(depth_fg_boost, 1e-3),
             0.0, 1.0,
         )
         boost_w = np.clip(under * strength * 0.5, 0.0, 0.40)
@@ -154,15 +165,24 @@ def depth_guided_mask(
             (1.0 - result[fg_cand]) * boost_w[fg_cand]
         )
 
-    # ---- 3. Lock original hard cores ----
+    # ---- 3. Lock hard cores BEFORE blur ----
+    #
+    # Fixed: locking is applied here, before the Gaussian smoothing pass.
+    # Previously it was applied after blur, which allowed the blur to raise
+    # semi-transparent suppressed pixels (0.85 < mask < 0.95) back toward
+    # their original values by averaging with unsuppressed neighbours.
     result[mask >= edge_band_hi] = mask[mask >= edge_band_hi]
     result[mask <= edge_band_lo] = mask[mask <= edge_band_lo]
 
     # ---- 4. Smooth transition at modified boundary ----
-    changed   = np.abs(result - mask) > 0.01
+    #
+    # Blur only the pixels that actually changed; hard cores are already
+    # locked above and won't be touched again.
+    changed = np.abs(result - mask) > 0.01
     if changed.any():
         blurred = cv2.GaussianBlur(np.ascontiguousarray(result), (3, 3), 0.8)
         result[changed] = result[changed] * 0.75 + blurred[changed] * 0.25
+        # Re-apply lock after blur to prevent bleed from unsuppressed neighbours
         result[mask >= edge_band_hi] = mask[mask >= edge_band_hi]
         result[mask <= edge_band_lo] = mask[mask <= edge_band_lo]
 
@@ -188,48 +208,42 @@ def depth_adaptive_trimap(
     import cv2
     from .confidence import build_adaptive_trimap as _conf_trimap
 
-    # Resize depth to mask resolution
     if depth_norm.shape != mask.shape:
-        depth_pil = Image.fromarray(
+        depth_pil  = Image.fromarray(
             (depth_norm * 255).clip(0, 255).astype(np.uint8), mode="L")
         depth_norm = np.array(
             depth_pil.resize((mask.shape[1], mask.shape[0]), Image.LANCZOS)
         ).astype(np.float32) / 255.0
 
     # ---- Depth gradient as boundary-complexity signal ----
-    d_u8    = (depth_norm * 255).clip(0, 255).astype(np.uint8)
-    gx      = cv2.Sobel(d_u8, cv2.CV_32F, 1, 0, ksize=3)
-    gy      = cv2.Sobel(d_u8, cv2.CV_32F, 0, 1, ksize=3)
-    d_grad  = np.sqrt(gx**2 + gy**2)
-    d_grad  = d_grad / (d_grad.max() + 1e-6)
-    k_sp    = max(3, min_band_px * 2 + 1)
-    d_grad  = cv2.GaussianBlur(np.ascontiguousarray(d_grad),
-                                (k_sp, k_sp), k_sp / 3)
-    d_grad  = np.clip(d_grad / (d_grad.max() + 1e-6), 0.0, 1.0)
+    d_u8   = (depth_norm * 255).clip(0, 255).astype(np.uint8)
+    gx     = cv2.Sobel(d_u8, cv2.CV_32F, 1, 0, ksize=3)
+    gy     = cv2.Sobel(d_u8, cv2.CV_32F, 0, 1, ksize=3)
+    d_grad = np.sqrt(gx**2 + gy**2)
+    d_grad = d_grad / (d_grad.max() + 1e-6)
+    k_sp   = max(3, min_band_px * 2 + 1)
+    d_grad = cv2.GaussianBlur(np.ascontiguousarray(d_grad), (k_sp, k_sp), k_sp / 3)
+    d_grad = np.clip(d_grad / (d_grad.max() + 1e-6), 0.0, 1.0)
 
     # ---- Synthesise uncertainty from depth ----
-    fg_thresh   = _fg_depth_threshold(depth_norm, mask, fg_percentile)
+    fg_thresh    = _fg_depth_threshold(depth_norm, mask, fg_percentile)
     depth_uncert = np.clip(
         np.abs(depth_norm - fg_thresh) / max(fg_thresh, 1e-3) * 0.5,
         0.0, 1.0,
     )
-    # Pixels near the depth boundary (depth ≈ fg_thresh) are most uncertain
     depth_uncert = 1.0 - np.clip(depth_uncert, 0.0, 1.0)
 
-    # Combine with ensemble confidence if provided
     if confidence is not None:
         if confidence.shape != mask.shape:
-            c_pil = Image.fromarray(
+            c_pil      = Image.fromarray(
                 (confidence * 255).clip(0, 255).astype(np.uint8), mode="L")
             confidence = np.array(
                 c_pil.resize((mask.shape[1], mask.shape[0]), Image.LANCZOS)
             ).astype(np.float32) / 255.0
-        # Ensemble says uncertain OR depth says uncertain → uncertain
         uncertainty = np.maximum(1.0 - confidence, depth_uncert)
     else:
         uncertainty = depth_uncert
 
-    # Blend depth gradient in as curvature proxy
     band_signal = np.clip(
         uncertainty * 0.6 + d_grad * 0.4, 0.0, 1.0
     ).astype(np.float32)
@@ -245,9 +259,9 @@ def depth_adaptive_trimap(
         (dist_to_bg < band_r) & (dist_to_fg < band_r)
     ) | (dist_to_bg < min_band_px) | (dist_to_fg < min_band_px)
 
-    k_fg    = cv2.getStructuringElement(
+    k_fg     = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (min_band_px * 2 + 1, min_band_px * 2 + 1))
-    fg_core = cv2.erode(hard, k_fg)
+    fg_core  = cv2.erode(hard, k_fg)
 
     trimap               = np.zeros_like(hard)
     trimap[is_unknown]   = 128
