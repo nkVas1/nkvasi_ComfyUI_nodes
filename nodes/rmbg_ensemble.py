@@ -28,6 +28,17 @@ MERGE_MODES = [
 BACKGROUNDS = ["alpha", "white", "black", "green", "red", "blue", "checkerboard"]
 
 
+def _mask_pil_to_np(mask_pil: Image.Image, target_size: int) -> np.ndarray:
+    """
+    Convert any PIL mask to a normalised float32 numpy array
+    at a fixed (target_size x target_size) resolution.
+    This guarantees all masks have identical shapes before merging,
+    regardless of what internal resolution each model used.
+    """
+    resized = mask_pil.convert("L").resize((target_size, target_size), Image.LANCZOS)
+    return np.array(resized).astype(np.float32) / 255.0
+
+
 class NkVasi_RMBG_Ensemble:
     """Multi-model ensemble for near-perfect background removal."""
 
@@ -85,6 +96,12 @@ class NkVasi_RMBG_Ensemble:
         results_img = []
         results_mask = []
 
+        # Merge resolution: use process_resolution as the canonical grid.
+        # Every model's output is resized to this before blending —
+        # this prevents numpy broadcast errors when models return
+        # different native sizes (e.g. BiRefNet-HR=2048, BEN2=1024).
+        merge_res = process_resolution
+
         for i in range(image.shape[0]):
             pil_img = tensor_to_pil(image[i])
             orig_w, orig_h = pil_img.size
@@ -94,28 +111,28 @@ class NkVasi_RMBG_Ensemble:
 
             if use_birefnet_hr:
                 m = load_birefnet("HR").infer(pil_img, process_resolution, fp16)
-                masks.append(np.array(m.convert("L")).astype(np.float32) / 255.0)
+                masks.append(_mask_pil_to_np(m, merge_res))
                 weights.append(birefnet_hr_weight)
 
             if use_birefnet_matting:
                 m = load_birefnet("matting").infer(pil_img, process_resolution, fp16)
-                masks.append(np.array(m.convert("L")).astype(np.float32) / 255.0)
+                masks.append(_mask_pil_to_np(m, merge_res))
                 weights.append(birefnet_matting_weight)
 
             if use_ben2:
                 m = load_ben2().infer(pil_img, process_resolution)
-                masks.append(np.array(m.convert("L")).astype(np.float32) / 255.0)
+                masks.append(_mask_pil_to_np(m, merge_res))
                 weights.append(ben2_weight)
 
             if use_rmbg2:
                 m = load_rmbg2().infer(pil_img, process_resolution, fp16)
-                masks.append(np.array(m.convert("L")).astype(np.float32) / 255.0)
+                masks.append(_mask_pil_to_np(m, merge_res))
                 weights.append(rmbg2_weight)
 
             if not masks:
                 raise ValueError("At least one model must be enabled in the Ensemble node.")
 
-            # ---- merge ----
+            # ---- merge (all masks are now merge_res x merge_res) ----
             mode = merge_mode.split(" ")[0]
             if mode == "weighted_avg":
                 total_w = sum(weights)
@@ -145,7 +162,10 @@ class NkVasi_RMBG_Ensemble:
             if mask_blur > 0:
                 merged = smooth_mask(merged, mask_blur)
 
-            mask_final = Image.fromarray((merged * 255).clip(0, 255).astype(np.uint8), mode="L")
+            # resize merged mask back to original image dimensions
+            mask_final = Image.fromarray(
+                (merged * 255).clip(0, 255).astype(np.uint8), mode="L"
+            )
             mask_final = mask_final.resize((orig_w, orig_h), Image.LANCZOS)
 
             if refine_foreground:
