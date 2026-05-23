@@ -12,9 +12,15 @@ from PIL import Image
 
 _CACHE: dict = {}
 
+# Directory used to cache Depth Pro source code (downloaded from GitHub)
+_DEPTH_PRO_SRC_CACHE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".cache", "depth_pro_src",
+)
+
 
 # ==========================================================================
-# Terminal UI — spinner + progress bar
+# Terminal UI — spinner
 # ==========================================================================
 class _SpinnerCtx:
     FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -55,10 +61,10 @@ class _SpinnerCtx:
         self._thread.join()
         c = self.C
         elapsed = time.time() - self._start
-        if exc_type is None:
-            status = f"{c['green']}{c['bold']}✓ loaded{c['reset']}"
-        else:
-            status = f"{c['red']}{c['bold']}✗ failed{c['reset']}"
+        status = (
+            f"{c['green']}{c['bold']}✓ loaded{c['reset']}" if exc_type is None
+            else f"{c['red']}{c['bold']}✗ failed{c['reset']}"
+        )
         sys.stdout.write(
             f"\r  {c['bold']}{c['cyan']}[nkVasi]{c['reset']} "
             f"{c['bold']}{self.label}{c['reset']} "
@@ -162,7 +168,6 @@ class _BEN2Wrapper:
             files = os.listdir(local_dir) if os.path.isdir(local_dir) else []
             raise FileNotFoundError(
                 f"[nkVasi] BEN2.py not found in snapshot: {local_dir}\nFiles present: {files}")
-
         if not os.path.exists(pth_file):
             files = os.listdir(local_dir) if os.path.isdir(local_dir) else []
             raise FileNotFoundError(
@@ -183,10 +188,7 @@ class _BEN2Wrapper:
 
     @torch.inference_mode()
     def infer(self, pil_img: Image.Image, resolution: int = 1024) -> Image.Image:
-        result = self.model.inference(
-            pil_img.convert("RGB"),
-            refine_foreground=False,
-        )
+        result = self.model.inference(pil_img.convert("RGB"), refine_foreground=False)
         if isinstance(result, Image.Image):
             if result.mode == "RGBA":
                 _, _, _, alpha = result.split()
@@ -255,52 +257,85 @@ class _InSPyReNetWrapper:
 # ==========================================================================
 # Depth Pro wrapper  (Apple MLRC, 2024)
 #
-# Loading strategies (tried in order):
-#   1. depth_pro pip package   (pip install git+https://github.com/apple/ml-depth-pro)
-#   2. HuggingFace transformers AutoModelForDepthEstimation  (apple/DepthPro)
-#   3. snapshot_download + robust src/ discovery + importlib.util load
+# The HuggingFace repo apple/DepthPro is WEIGHTS-ONLY (depth_pro.pt + README).
+# Python source lives at https://github.com/apple/ml-depth-pro
+#
+# Loading strategies:
+#   1. depth_pro already installed as pip package
+#   2. transformers AutoModelForDepthEstimation (falls back gracefully)
+#   3a. Download source ZIP from GitHub → extract to .cache/depth_pro_src/
+#   3b. Download weights from HuggingFace snapshot
+#   3c. Load via importlib from extracted source
 # ==========================================================================
 
-def _find_depth_pro_src(root: str) -> str | None:
-    """
-    Recursively search `root` for a directory containing depth_pro/__init__.py.
-    Returns the parent directory (the one to add to sys.path), or None.
-    """
-    for dirpath, dirnames, filenames in os.walk(root):
-        if "depth_pro" in dirnames:
-            candidate = os.path.join(dirpath, "depth_pro", "__init__.py")
-            if os.path.exists(candidate):
-                return dirpath  # add dirpath so `import depth_pro` works
-    return None
+_DEPTH_PRO_GITHUB_ZIP = (
+    "https://github.com/apple/ml-depth-pro/archive/refs/heads/main.zip"
+)
 
 
-def _find_checkpoint(root: str) -> str | None:
+def _ensure_depth_pro_src() -> str:
     """
-    Search for the Depth Pro checkpoint file inside `root`.
-    Apple repo uses 'depth_pro.pt'; HF LFS may store it under blobs/.
+    Ensure the Depth Pro Python source is present in _DEPTH_PRO_SRC_CACHE.
+    Downloads and extracts from GitHub if not already present.
+    Returns the path that should be added to sys.path (contains depth_pro/).
     """
-    for name in ("depth_pro.pt", "pytorch_model.bin", "model.safetensors"):
-        for dirpath, _, filenames in os.walk(root):
-            if name in filenames:
-                return os.path.join(dirpath, name)
-    return None
+    # Expected: .cache/depth_pro_src/ml-depth-pro-main/src/
+    src_parent = os.path.join(_DEPTH_PRO_SRC_CACHE, "ml-depth-pro-main", "src")
+    marker     = os.path.join(src_parent, "depth_pro", "__init__.py")
+
+    if os.path.exists(marker):
+        return src_parent
+
+    # Download ZIP
+    import urllib.request
+    import zipfile
+    c = _SpinnerCtx.C
+
+    os.makedirs(_DEPTH_PRO_SRC_CACHE, exist_ok=True)
+    zip_path = os.path.join(_DEPTH_PRO_SRC_CACHE, "ml-depth-pro-main.zip")
+
+    print(f"  {c['dim']}Downloading Depth Pro source from GitHub…{c['reset']}")
+    print(f"  {c['dim']}URL: {_DEPTH_PRO_GITHUB_ZIP}{c['reset']}")
+
+    try:
+        urllib.request.urlretrieve(_DEPTH_PRO_GITHUB_ZIP, zip_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"[nkVasi] Failed to download Depth Pro source ZIP: {e}\n"
+            f"Please install manually: pip install git+https://github.com/apple/ml-depth-pro"
+        ) from e
+
+    print(f"  {c['dim']}Extracting…{c['reset']}")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(_DEPTH_PRO_SRC_CACHE)
+
+    os.remove(zip_path)  # clean up zip, keep extracted dir
+
+    if not os.path.exists(marker):
+        # Fallback: search recursively in case archive structure differs
+        for dp, dn, _ in os.walk(_DEPTH_PRO_SRC_CACHE):
+            if "depth_pro" in dn:
+                candidate = os.path.join(dp, "depth_pro", "__init__.py")
+                if os.path.exists(candidate):
+                    return dp
+        raise RuntimeError(
+            f"[nkVasi] Could not find depth_pro/__init__.py after extraction.\n"
+            f"Cache dir: {_DEPTH_PRO_SRC_CACHE}"
+        )
+
+    return src_parent
 
 
 def _importlib_load_depth_pro(src_parent: str):
-    """
-    Load depth_pro as a module via importlib so we don't depend on sys.path
-    being clean, and avoid conflicts with a previously-cached failed import.
-    """
-    import importlib
+    """Load depth_pro via importlib, purging any stale sys.modules entries first."""
     import importlib.util
 
-    # Remove any stale cached entry (e.g. from a failed bare import attempt)
     for key in list(sys.modules.keys()):
         if key == "depth_pro" or key.startswith("depth_pro."):
             del sys.modules[key]
 
     init_path = os.path.join(src_parent, "depth_pro", "__init__.py")
-    spec   = importlib.util.spec_from_file_location(
+    spec = importlib.util.spec_from_file_location(
         "depth_pro", init_path,
         submodule_search_locations=[os.path.join(src_parent, "depth_pro")],
     )
@@ -318,7 +353,7 @@ class _DepthProWrapper:
         c = _SpinnerCtx.C
         self._strategy: str = ""
 
-        # ---- Strategy 1: official depth-pro pip package ----
+        # ---- Strategy 1: pip package already installed ----
         try:
             print(f"  {c['dim']}Strategy 1/3 · depth_pro pip package{c['reset']}")
             with _SpinnerCtx("DepthPro · pip package         "):
@@ -330,9 +365,9 @@ class _DepthProWrapper:
             self._strategy = "pip"
             return
         except Exception as e:
-            print(f"  {c['dim']}depth_pro not available ({e}), trying Strategy 2…{c['reset']}")
+            print(f"  {c['dim']}pip strategy failed ({e}), trying Strategy 2…{c['reset']}")
 
-        # ---- Strategy 2: HuggingFace transformers pipeline ----
+        # ---- Strategy 2: transformers pipeline ----
         try:
             print(f"  {c['dim']}Strategy 2/3 · transformers AutoModel{c['reset']}")
             with _SpinnerCtx("DepthPro · transformers         "):
@@ -350,58 +385,40 @@ class _DepthProWrapper:
         except Exception as e:
             print(f"  {c['dim']}transformers strategy failed ({e}), trying Strategy 3…{c['reset']}")
 
-        # ---- Strategy 3: snapshot_download + robust dynamic import ----
-        print(f"  {c['dim']}Strategy 3/3 · snapshot_download + importlib{c['reset']}")
+        # ---- Strategy 3: GitHub source ZIP + HF weights ----
+        print(f"  {c['dim']}Strategy 3/3 · GitHub source ZIP + HF weights{c['reset']}")
+
+        # 3a — Get Python source from GitHub
         try:
-            from huggingface_hub import snapshot_download
-            with _SpinnerCtx("DepthPro · snapshot_download   "):
-                local_dir = snapshot_download(repo_id=self.HF_ID)
+            with _SpinnerCtx("DepthPro · source from GitHub  "):
+                src_parent = _ensure_depth_pro_src()
         except Exception as e:
-            raise RuntimeError(f"[nkVasi] Depth Pro download failed: {e}") from e
+            raise RuntimeError(str(e)) from e
 
-        c2 = _SpinnerCtx.C
-        print(f"  {c2['dim']}Snapshot path: {local_dir}{c2['reset']}")
+        print(f"  {c['dim']}Source ready at: {src_parent}{c['reset']}")
 
-        # --- Find src/depth_pro anywhere in the snapshot tree ---
-        src_parent = _find_depth_pro_src(local_dir)
-        if src_parent is None:
-            # Snapshot may not include Python source (weights-only repo).
-            # Try HF hub cache blobs structure one level up.
-            parent = os.path.dirname(local_dir)
-            src_parent = _find_depth_pro_src(parent)
-
-        if src_parent is None:
-            files_found = []
-            for dp, dn, fn in os.walk(local_dir):
-                for f in fn:
-                    files_found.append(os.path.relpath(os.path.join(dp, f), local_dir))
+        # 3b — Get weights from HuggingFace (weights-only snapshot)
+        try:
+            from huggingface_hub import hf_hub_download
+            with _SpinnerCtx("DepthPro · weights from HF     "):
+                ckpt_path = hf_hub_download(
+                    repo_id=self.HF_ID,
+                    filename="depth_pro.pt",
+                )
+        except Exception as e:
             raise RuntimeError(
-                f"[nkVasi] Depth Pro: could not find depth_pro/__init__.py in snapshot.\n"
-                f"Files in snapshot:\n" + "\n".join(files_found[:40])
-            )
+                f"[nkVasi] Depth Pro: failed to download weights: {e}"
+            ) from e
 
-        print(f"  {c2['dim']}Found depth_pro source at: {src_parent}{c2['reset']}")
+        print(f"  {c['dim']}Weights: {ckpt_path}{c['reset']}")
 
-        # --- Find checkpoint ---
-        ckpt_path = _find_checkpoint(local_dir)
-        if ckpt_path is None:
-            ckpt_path = _find_checkpoint(os.path.dirname(local_dir))
-        print(f"  {c2['dim']}Checkpoint: {ckpt_path}{c2['reset']}")
-
+        # 3c — Load via importlib
         try:
             with _SpinnerCtx("DepthPro · dynamic import      "):
                 depth_pro = _importlib_load_depth_pro(src_parent)
-
-                if ckpt_path is not None:
-                    # Build config with explicit checkpoint path
-                    cfg = depth_pro.DepthProConfig(checkpoint_uri=ckpt_path)
-                    self._model, self._transform = \
-                        depth_pro.create_model_and_transforms(config=cfg)
-                else:
-                    # Let the library find the checkpoint itself
-                    self._model, self._transform = \
-                        depth_pro.create_model_and_transforms()
-
+                cfg = depth_pro.DepthProConfig(checkpoint_uri=ckpt_path)
+                self._model, self._transform = \
+                    depth_pro.create_model_and_transforms(config=cfg)
                 self._model.eval()
                 if torch.cuda.is_available():
                     self._model = self._model.cuda()
@@ -409,15 +426,12 @@ class _DepthProWrapper:
         except Exception as e:
             raise RuntimeError(
                 f"[nkVasi] Depth Pro all strategies failed: {e}\n"
-                f"Try: pip install git+https://github.com/apple/ml-depth-pro"
+                f"Manual fix: pip install git+https://github.com/apple/ml-depth-pro"
             ) from e
 
     @torch.inference_mode()
     def infer(self, pil_img: Image.Image) -> np.ndarray:
-        """
-        Run Depth Pro on a PIL image.
-        Returns float32 H×W normalised depth: 0=nearest (FG), 1=farthest (BG).
-        """
+        """Returns float32 H×W normalised depth: 0=nearest (FG), 1=farthest (BG)."""
         rgb = pil_img.convert("RGB")
 
         if self._strategy in ("pip", "snapshot"):
@@ -440,21 +454,18 @@ class _DepthProWrapper:
         else:
             raise RuntimeError("[nkVasi] DepthPro: no strategy loaded")
 
-        # Normalise to [0, 1]
         d_min, d_max = float(depth.min()), float(depth.max())
         if d_max - d_min < 1e-5:
             return np.zeros_like(depth)
         norm = (depth - d_min) / (d_max - d_min)
 
-        # Auto-detect and fix inverted depth (centre should be FG = low value)
+        # Auto-detect inverted depth and fix (FG centre should be low=near)
         h, w   = norm.shape
         cy, cx = h // 2, w // 2
         centre_val = float(norm[cy - h // 8:cy + h // 8, cx - w // 8:cx + w // 8].mean())
         border_val = float(np.concatenate([
-            norm[:h // 8, :].ravel(),
-            norm[-h // 8:, :].ravel(),
-            norm[:, :w // 8].ravel(),
-            norm[:, -w // 8:].ravel(),
+            norm[:h // 8, :].ravel(), norm[-h // 8:, :].ravel(),
+            norm[:, :w // 8].ravel(), norm[:, -w // 8:].ravel(),
         ]).mean())
         if centre_val > border_val:
             norm = 1.0 - norm
@@ -471,24 +482,20 @@ def load_birefnet(variant: str = "HR") -> _BiRefNetWrapper:
         _CACHE[key] = _BiRefNetWrapper(variant)
     return _CACHE[key]
 
-
 def load_ben2() -> _BEN2Wrapper:
     if "ben2" not in _CACHE:
         _CACHE["ben2"] = _BEN2Wrapper()
     return _CACHE["ben2"]
-
 
 def load_rmbg2() -> _RMBG2Wrapper:
     if "rmbg2" not in _CACHE:
         _CACHE["rmbg2"] = _RMBG2Wrapper()
     return _CACHE["rmbg2"]
 
-
 def load_inspyrenet() -> _InSPyReNetWrapper:
     if "inspyrenet" not in _CACHE:
         _CACHE["inspyrenet"] = _InSPyReNetWrapper()
     return _CACHE["inspyrenet"]
-
 
 def load_depth_pro() -> _DepthProWrapper:
     if "depth_pro" not in _CACHE:
