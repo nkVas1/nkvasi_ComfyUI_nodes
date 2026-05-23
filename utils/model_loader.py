@@ -126,11 +126,6 @@ class _BiRefNetWrapper:
 
 # ==========================================================================
 # BEN2 wrapper
-# Two loading strategies (tried in order):
-#   1. pip package  `ben2`  (cleanest, AutoModel.from_pretrained)
-#   2. Dynamic import of BEN2.py from snapshot_download cache
-#
-# The HF repo contains:  BEN2.py  +  BEN2_Base.pth  (NOT BEN2_Base.py)
 # ==========================================================================
 class _BEN2Wrapper:
     HF_ID = "PramaLLC/BEN2"
@@ -139,7 +134,6 @@ class _BEN2Wrapper:
         _header("BEN2", self.HF_ID)
         c = _SpinnerCtx.C
 
-        # ---- Strategy 1: use official ben2 pip package ----
         try:
             print(f"  {c['dim']}Strategy 1/2 · loading via ben2 pip package{c['reset']}")
             with _SpinnerCtx("BEN2 · AutoModel.from_pretrained"):
@@ -153,7 +147,6 @@ class _BEN2Wrapper:
         except Exception as e:
             print(f"  {c['dim']}ben2 package not available ({e}), trying Strategy 2…{c['reset']}")
 
-        # ---- Strategy 2: dynamic import of BEN2.py from HF snapshot ----
         print(f"  {c['dim']}Strategy 2/2 · snapshot_download + dynamic import{c['reset']}")
         try:
             from huggingface_hub import snapshot_download
@@ -162,31 +155,24 @@ class _BEN2Wrapper:
         except Exception as e:
             raise RuntimeError(f"[nkVasi] BEN2 download failed: {e}") from e
 
-        # The file in the HF repo is  BEN2.py  (not BEN2_Base.py)
-        ben2_py = os.path.join(local_dir, "BEN2.py")
+        ben2_py  = os.path.join(local_dir, "BEN2.py")
         pth_file = os.path.join(local_dir, "BEN2_Base.pth")
 
         if not os.path.exists(ben2_py):
-            # list what we actually got so the user can report it
             files = os.listdir(local_dir) if os.path.isdir(local_dir) else []
             raise FileNotFoundError(
-                f"[nkVasi] BEN2.py not found in snapshot: {local_dir}\n"
-                f"Files present: {files}"
-            )
+                f"[nkVasi] BEN2.py not found in snapshot: {local_dir}\nFiles present: {files}")
 
         if not os.path.exists(pth_file):
             files = os.listdir(local_dir) if os.path.isdir(local_dir) else []
             raise FileNotFoundError(
-                f"[nkVasi] BEN2_Base.pth not found in snapshot: {local_dir}\n"
-                f"Files present: {files}"
-            )
+                f"[nkVasi] BEN2_Base.pth not found in snapshot: {local_dir}\nFiles present: {files}")
 
         with _SpinnerCtx("BEN2 · load weights            "):
             import importlib.util
-            spec = importlib.util.spec_from_file_location("BEN2_module", ben2_py)
+            spec   = importlib.util.spec_from_file_location("BEN2_module", ben2_py)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-
             self.model = module.BEN_Base()
             self.model.loadcheckpoints(pth_file)
             self.model.eval()
@@ -199,15 +185,13 @@ class _BEN2Wrapper:
     def infer(self, pil_img: Image.Image, resolution: int = 1024) -> Image.Image:
         result = self.model.inference(
             pil_img.convert("RGB"),
-            refine_foreground=False,  # nkVasi does its own post-processing
+            refine_foreground=False,
         )
-        # Both strategies return an RGBA PIL image
         if isinstance(result, Image.Image):
             if result.mode == "RGBA":
                 _, _, _, alpha = result.split()
                 return alpha
             return result.convert("L")
-        # fallback: tensor mask
         if isinstance(result, torch.Tensor):
             arr = result.squeeze().cpu().numpy()
             return Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8), mode="L")
@@ -269,6 +253,139 @@ class _InSPyReNetWrapper:
 
 
 # ==========================================================================
+# Depth Pro wrapper  (Apple MLRC, 2024)
+#
+# Loading strategies (tried in order):
+#   1. depth_pro pip package   (pip install depth-pro)
+#   2. HuggingFace transformers AutoModelForDepthEstimation  (apple/DepthPro)
+#   3. snapshot_download + dynamic import of depth_pro source
+# ==========================================================================
+class _DepthProWrapper:
+    HF_ID = "apple/DepthPro"
+
+    def __init__(self):
+        _header("Depth Pro", self.HF_ID)
+        c = _SpinnerCtx.C
+        self._strategy: str = ""
+
+        # ---- Strategy 1: official depth-pro pip package ----
+        try:
+            print(f"  {c['dim']}Strategy 1/3 · depth_pro pip package{c['reset']}")
+            with _SpinnerCtx("DepthPro · pip package         "):
+                import depth_pro
+                self._model, self._transform = depth_pro.create_model_and_transforms()
+                self._model.eval()
+                if torch.cuda.is_available():
+                    self._model = self._model.cuda()
+            self._strategy = "pip"
+            return
+        except Exception as e:
+            print(f"  {c['dim']}depth_pro not available ({e}), trying Strategy 2…{c['reset']}")
+
+        # ---- Strategy 2: HuggingFace transformers pipeline ----
+        try:
+            print(f"  {c['dim']}Strategy 2/3 · transformers AutoModel{c['reset']}")
+            with _SpinnerCtx("DepthPro · transformers         "):
+                from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+                self._processor = AutoImageProcessor.from_pretrained(self.HF_ID)
+                self._model     = AutoModelForDepthEstimation.from_pretrained(
+                    self.HF_ID, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                )
+                self._model.eval()
+                if torch.cuda.is_available():
+                    self._model = self._model.cuda()
+            self._strategy = "transformers"
+            return
+        except Exception as e:
+            print(f"  {c['dim']}transformers strategy failed ({e}), trying Strategy 3…{c['reset']}")
+
+        # ---- Strategy 3: snapshot_download + dynamic import ----
+        print(f"  {c['dim']}Strategy 3/3 · snapshot_download{c['reset']}")
+        try:
+            from huggingface_hub import snapshot_download
+            with _SpinnerCtx("DepthPro · snapshot_download   "):
+                local_dir = snapshot_download(repo_id=self.HF_ID)
+        except Exception as e:
+            raise RuntimeError(f"[nkVasi] Depth Pro download failed: {e}") from e
+
+        src_path = os.path.join(local_dir, "src")
+        if os.path.isdir(src_path):
+            sys.path.insert(0, src_path)
+
+        try:
+            with _SpinnerCtx("DepthPro · dynamic import      "):
+                import depth_pro
+                self._model, self._transform = depth_pro.create_model_and_transforms(
+                    config=depth_pro.DepthProConfig(
+                        checkpoint_uri=os.path.join(local_dir, "depth_pro.pt")
+                    )
+                )
+                self._model.eval()
+                if torch.cuda.is_available():
+                    self._model = self._model.cuda()
+            self._strategy = "snapshot"
+        except Exception as e:
+            raise RuntimeError(
+                f"[nkVasi] Depth Pro all strategies failed: {e}\n"
+                f"Try: pip install git+https://github.com/apple/ml-depth-pro"
+            ) from e
+
+    @torch.inference_mode()
+    def infer(self, pil_img: Image.Image) -> np.ndarray:
+        """
+        Run Depth Pro on a PIL image.
+        Returns float32 H×W depth in metres (metric) OR normalised [0,1]
+        depending on strategy.  Always normalised to [0,1] before return,
+        with 0=nearest, 1=farthest.
+        """
+        rgb = pil_img.convert("RGB")
+
+        if self._strategy in ("pip", "snapshot"):
+            # Official depth_pro API
+            device = next(self._model.parameters()).device
+            inp    = self._transform(rgb).unsqueeze(0).to(device)
+            result = self._model.infer(inp)
+            depth  = result["depth"].squeeze().cpu().numpy().astype(np.float32)
+
+        elif self._strategy == "transformers":
+            device = next(self._model.parameters()).device
+            inputs = self._processor(images=rgb, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16 if device.type == "cuda" else torch.float32,
+            ):
+                outputs = self._model(**inputs)
+            depth = outputs.predicted_depth.squeeze().cpu().numpy().astype(np.float32)
+
+        else:
+            raise RuntimeError("[nkVasi] DepthPro: no strategy loaded")
+
+        # Normalise: 0 = nearest, 1 = farthest
+        d_min, d_max = float(depth.min()), float(depth.max())
+        if d_max - d_min < 1e-5:
+            return np.zeros_like(depth)
+        norm = (depth - d_min) / (d_max - d_min)
+        # Depth Pro returns inverse depth (closer = higher value) in some
+        # variants — detect and flip if so by checking if FG has higher values
+        # (we assume the image centre is typically FG)
+        h, w  = norm.shape
+        cy, cx = h // 2, w // 2
+        centre_val  = float(norm[cy-h//8:cy+h//8, cx-w//8:cx+w//8].mean())
+        border_val  = float(np.concatenate([
+            norm[:h//8, :].ravel(),
+            norm[-h//8:, :].ravel(),
+            norm[:, :w//8].ravel(),
+            norm[:, -w//8:].ravel(),
+        ]).mean())
+        if centre_val > border_val:
+            # Centre is "far" — this is inverted depth; flip so near=0, far=1
+            norm = 1.0 - norm
+
+        return norm.astype(np.float32)
+
+
+# ==========================================================================
 # Public accessors
 # ==========================================================================
 def load_birefnet(variant: str = "HR") -> _BiRefNetWrapper:
@@ -294,3 +411,9 @@ def load_inspyrenet() -> _InSPyReNetWrapper:
     if "inspyrenet" not in _CACHE:
         _CACHE["inspyrenet"] = _InSPyReNetWrapper()
     return _CACHE["inspyrenet"]
+
+
+def load_depth_pro() -> _DepthProWrapper:
+    if "depth_pro" not in _CACHE:
+        _CACHE["depth_pro"] = _DepthProWrapper()
+    return _CACHE["depth_pro"]
